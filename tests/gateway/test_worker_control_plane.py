@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -17,12 +18,23 @@ from gateway.worker_control_plane.service import WorkerControlPlaneService
 from tests.gateway.worker_control_plane_helpers import MockWorkerClient
 
 
+class MutableTestClock:
+    def __init__(self):
+        self.value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += timedelta(seconds=seconds)
+
+
 @pytest_asyncio.fixture
 async def control_plane(tmp_path):
     settings = WorkerControlPlaneSettings.for_test(
         tmp_path / "worker-control-plane.db", approved_test_root=tmp_path
     )
-    service = WorkerControlPlaneService(settings)
+    service = WorkerControlPlaneService(settings, clock=MutableTestClock())
     secret = service.seed_test_worker()
     app = create_worker_control_plane_app(settings, service)
     server = TestServer(app)

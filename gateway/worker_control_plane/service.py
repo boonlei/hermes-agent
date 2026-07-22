@@ -1,6 +1,7 @@
 """Small transactional domain service for test-only system.echo."""
 from __future__ import annotations
-import json, uuid
+import json, secrets, uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from .auth import bootstrap_record, verify_bootstrap, new_access_token, verify_access_token
 from .config import WorkerControlPlaneSettings
@@ -26,24 +27,38 @@ class WorkerAuthService:
   return row
 
 class WorkerControlPlaneService:
- def __init__(self, settings, *, now=None):
+ def __init__(self, settings, *, clock: Callable[[], datetime] | None = None):
   if not settings.enabled or settings.test_mode == settings.pilot_mode: raise ValueError('isolated mode required')
-  self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._now=now or datetime(2026,1,1,tzinfo=timezone.utc); self.auth=WorkerAuthService(self.store,self.now)
- def now(self): return self._now.isoformat().replace('+00:00','Z')
- def advance_for_test(self, seconds): self._now += timedelta(seconds=seconds)
+  self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._clock=clock or (lambda: datetime.now(timezone.utc)); self.auth=WorkerAuthService(self.store,self.now)
+ def _now_datetime(self):
+  value=self._clock()
+  if not isinstance(value,datetime) or value.tzinfo is None: raise RuntimeError('clock must return timezone-aware datetime')
+  return value.astimezone(timezone.utc)
+ def now(self): return self._now_datetime().isoformat().replace('+00:00','Z')
+ def advance_for_test(self, seconds):
+  advance=getattr(self._clock,'advance',None)
+  if advance is None: raise RuntimeError('test clock was not injected')
+  advance(seconds)
  def close(self): self.store.close()
  def _audit(self,c,event,**fields):
   safe={k:v for k,v in fields.items() if k in {'worker_id','instance_id','registration_id','task_id','delivery_id','trace_id','outcome','reason_code'}}
   c.execute("INSERT INTO worker_audit_log(occurred_at,event_type,worker_id,instance_id,registration_id,task_id,delivery_id,trace_id,outcome,reason_code) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.now(),event,safe.get('worker_id'),safe.get('instance_id'),safe.get('registration_id'),safe.get('task_id'),safe.get('delivery_id'),safe.get('trace_id'),safe.get('outcome','ok'),safe.get('reason_code')))
  def record_rejection(self,event,**fields):
   with self.store.transaction() as c: self._audit(c,event,outcome='rejected',**fields)
- def provision_worker(self):
+ def provision_worker(self, *, secret=None, install_credential=None):
   if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
-  secret=__import__('secrets').token_urlsafe(32); salt,digest=bootstrap_record(secret)
-  with self.store.transaction() as c:
-   c.execute("INSERT INTO workers(worker_id,worker_name,allowed_capabilities,enabled,revoked_at) VALUES(?,?,?,1,NULL) ON CONFLICT(worker_id) DO UPDATE SET worker_name=excluded.worker_name,allowed_capabilities=excluded.allowed_capabilities,enabled=1,revoked_at=NULL",('server-a-worker','Hermes local pilot worker','[\"system.echo\"]'))
-   c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",(self.now(),'server-a-worker'))
-   c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),'server-a-worker','bootstrap',digest,salt,self.now(),None,None)); self._audit(c,'worker_provisioned',worker_id='server-a-worker')
+  secret=secret or secrets.token_urlsafe(32); salt,digest=bootstrap_record(secret)
+  rollback_file=None; finalize_file=None
+  try:
+   with self.store.transaction() as c:
+    c.execute("INSERT INTO workers(worker_id,worker_name,allowed_capabilities,enabled,revoked_at) VALUES(?,?,?,1,NULL) ON CONFLICT(worker_id) DO UPDATE SET worker_name=excluded.worker_name,allowed_capabilities=excluded.allowed_capabilities,enabled=1,revoked_at=NULL",('server-a-worker','Hermes local pilot worker','[\"system.echo\"]'))
+    c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",(self.now(),'server-a-worker'))
+    c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),'server-a-worker','bootstrap',digest,salt,self.now(),None,None)); self._audit(c,'worker_provisioned',worker_id='server-a-worker')
+    if install_credential is not None: rollback_file,finalize_file=install_credential()
+  except Exception:
+   if rollback_file is not None: rollback_file()
+   raise
+  if finalize_file is not None: finalize_file()
   return secret
  def seed_test_worker(self):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
@@ -74,7 +89,7 @@ class WorkerControlPlaneService:
   with self.store.transaction() as c:
    active=c.execute("SELECT * FROM worker_instances WHERE worker_id=? AND status='active'",(d['worker_id'],)).fetchone()
    if active and active['instance_id'] != iid: self._audit(c,'registration_rejected',worker_id=d['worker_id'],outcome='rejected',reason_code='duplicate_active_instance'); raise error('duplicate_active_instance')
-   token,thash=new_access_token(); cid=str(uuid.uuid4()); expiry=(self._now+timedelta(seconds=self.settings.token_ttl_seconds)).isoformat().replace('+00:00','Z')
+   token,thash=new_access_token(); cid=str(uuid.uuid4()); expiry=(self._now_datetime()+timedelta(seconds=self.settings.token_ttl_seconds)).isoformat().replace('+00:00','Z')
    if active:
     c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=?",(self.now(),active['access_credential_id'])); rid=active['registration_id']; status=200; event='worker_reregistered'
    else:
@@ -134,7 +149,7 @@ class WorkerControlPlaneService:
    task=c.execute("SELECT * FROM worker_tasks WHERE state='queued' ORDER BY available_at,created_at,rowid LIMIT 1").fetchone(); self._audit(c,'poll_received',worker_id=row['worker_id'])
    if not task:
     self._dedup_store(c,row,d,key,'POST','/worker/v1/tasks/poll','',None,204); self._audit(c,'poll_no_task',worker_id=row['worker_id']); return None
-   attempt=task['attempt']+1; did=str(uuid.uuid4()); ack=(self._now+timedelta(seconds=self.settings.ack_deadline_seconds)).isoformat().replace('+00:00','Z'); lease=(self._now+timedelta(seconds=self.settings.lease_seconds)).isoformat().replace('+00:00','Z')
+   current=self._now_datetime(); attempt=task['attempt']+1; did=str(uuid.uuid4()); ack=(current+timedelta(seconds=self.settings.ack_deadline_seconds)).isoformat().replace('+00:00','Z'); lease=(current+timedelta(seconds=self.settings.lease_seconds)).isoformat().replace('+00:00','Z')
    c.execute("UPDATE worker_tasks SET state='leased',attempt=?,leased_until=? WHERE task_id=?",(attempt,lease,task['task_id'])); c.execute("INSERT INTO worker_deliveries VALUES(?,?,?,?,?,?,?,?,?,?,?)",(did,task['task_id'],row['worker_id'],row['registration_id'],attempt,'leased',self.now(),ack,lease,None,None)); env={'task':{'task_id':task['task_id'],'delivery_id':did,'task_type':'system.echo','payload':json.loads(task['payload_json']),'payload_hash':task['payload_hash'],'trace_id':task['trace_id'],'attempt':attempt,'max_attempts':task['max_attempts'],'ack_deadline_at':ack,'lease_expires_at':lease}}
    self._dedup_store(c,row,d,key,'POST','/worker/v1/tasks/poll','',env,200); self._audit(c,'task_leased',worker_id=row['worker_id'],task_id=task['task_id'],delivery_id=did,trace_id=task['trace_id']); return env
  def ack_delivery(self,task_id,d,token,key):

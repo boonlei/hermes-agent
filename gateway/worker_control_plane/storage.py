@@ -2,9 +2,14 @@
 from __future__ import annotations
 import os
 import sqlite3
+import stat
 from contextlib import contextmanager
 
-from .config import WorkerControlPlaneSettings, resolve_test_database_path
+from .config import (
+    WorkerControlPlaneSettings,
+    resolve_pilot_database_path,
+    resolve_test_database_path,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -25,9 +30,18 @@ class WorkerControlPlaneStore:
    raise TypeError("WorkerControlPlaneStore requires validated settings")
   if not settings.enabled or settings.test_mode == settings.pilot_mode:
    raise ValueError("Worker Control Plane storage requires one isolated mode")
-  root,path=resolve_test_database_path(settings.approved_test_root,settings.db_path)
+  if settings.pilot_mode and not settings.test_pilot_mode:
+   root,path=resolve_pilot_database_path(settings.approved_test_root,settings.db_path)
+  else:
+   root,path=resolve_test_database_path(settings.approved_test_root,settings.db_path,allow_test_pilot_filename=settings.test_pilot_mode)
   if root != settings.approved_test_root:
    raise ValueError("approved test root changed after settings validation")
+  try:
+   info=os.lstat(path)
+  except FileNotFoundError:
+   info=None
+  if info is not None and (not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600 or info.st_nlink!=1):
+   raise ValueError("database file is unsafe")
   self.conn=sqlite3.connect(path, check_same_thread=False); os.chmod(path,0o600); self.conn.row_factory=sqlite3.Row
   self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA synchronous=FULL"); self.conn.execute("PRAGMA secure_delete=ON"); self.conn.execute("PRAGMA cell_size_check=ON")
   try: self.conn.execute("PRAGMA journal_mode=WAL")
