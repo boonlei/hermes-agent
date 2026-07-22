@@ -1,5 +1,6 @@
 """Dedicated SQLite persistence for the test-only control plane."""
 from __future__ import annotations
+import os
 import sqlite3
 from contextlib import contextmanager
 
@@ -22,12 +23,12 @@ class WorkerControlPlaneStore:
  def __init__(self, settings: WorkerControlPlaneSettings):
   if not isinstance(settings, WorkerControlPlaneSettings):
    raise TypeError("WorkerControlPlaneStore requires validated settings")
-  if not settings.enabled or not settings.test_mode:
-   raise ValueError("Worker Control Plane storage requires enabled test mode")
+  if not settings.enabled or settings.test_mode == settings.pilot_mode:
+   raise ValueError("Worker Control Plane storage requires one isolated mode")
   root,path=resolve_test_database_path(settings.approved_test_root,settings.db_path)
   if root != settings.approved_test_root:
    raise ValueError("approved test root changed after settings validation")
-  self.conn=sqlite3.connect(path, check_same_thread=False); self.conn.row_factory=sqlite3.Row
+  self.conn=sqlite3.connect(path, check_same_thread=False); os.chmod(path,0o600); self.conn.row_factory=sqlite3.Row
   self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA synchronous=FULL"); self.conn.execute("PRAGMA secure_delete=ON"); self.conn.execute("PRAGMA cell_size_check=ON")
   try: self.conn.execute("PRAGMA journal_mode=WAL")
   except sqlite3.DatabaseError: self.conn.execute("PRAGMA journal_mode=DELETE")

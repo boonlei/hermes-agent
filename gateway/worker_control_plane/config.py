@@ -13,6 +13,8 @@ _PRODUCTION_DB_NAMES = {
     "state.db",
 }
 
+_PILOT_DB_SUFFIX = (".hermes", "worker-control-plane-pilot", "worker-control-plane.db")
+
 
 def resolve_test_database_path(
     approved_test_root: Path, db_path: Path
@@ -36,7 +38,10 @@ def resolve_test_database_path(
         raise ValueError("test database must be inside the approved test root") from None
     if relative == Path("."):
         raise ValueError("database path must name a file below the approved root")
-    if ".hermes" in resolved_db.parts or resolved_db.name.lower() in _PRODUCTION_DB_NAMES:
+    is_approved_pilot_path = tuple(resolved_db.parts[-3:]) == _PILOT_DB_SUFFIX
+    if resolved_db.name.lower() in _PRODUCTION_DB_NAMES or (
+        ".hermes" in resolved_db.parts and not is_approved_pilot_path
+    ):
         raise ValueError("production-like Hermes database paths are forbidden")
     return root, resolved_db
 
@@ -47,6 +52,7 @@ class WorkerControlPlaneSettings:
     test_mode: bool
     db_path: Path
     approved_test_root: Path
+    pilot_mode: bool = False
     token_ttl_seconds: int = 300
     heartbeat_seconds: int = 30
     ack_deadline_seconds: int = 10
@@ -58,8 +64,10 @@ class WorkerControlPlaneSettings:
     max_attempts: int = 3
 
     def __post_init__(self) -> None:
-        if not self.enabled or not self.test_mode:
-            raise ValueError("Worker Control Plane storage requires enabled test mode")
+        if not self.enabled or self.test_mode == self.pilot_mode:
+            raise ValueError(
+                "Worker Control Plane requires exactly one enabled isolated mode"
+            )
         for name in (
             "token_ttl_seconds", "heartbeat_seconds", "ack_deadline_seconds",
             "lease_seconds", "max_body_bytes", "max_stdout_bytes",
@@ -84,4 +92,15 @@ class WorkerControlPlaneSettings:
             test_mode=True,
             db_path=db_path,
             approved_test_root=approved_test_root,
+        )
+
+    @classmethod
+    def for_pilot(cls, data_dir: Path, **overrides) -> "WorkerControlPlaneSettings":
+        return cls(
+            enabled=True,
+            test_mode=False,
+            pilot_mode=True,
+            db_path=Path(data_dir) / "worker-control-plane.db",
+            approved_test_root=Path(data_dir),
+            **overrides,
         )

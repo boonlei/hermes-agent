@@ -27,7 +27,7 @@ class WorkerAuthService:
 
 class WorkerControlPlaneService:
  def __init__(self, settings, *, now=None):
-  if not settings.enabled or not settings.test_mode: raise ValueError('test mode required')
+  if not settings.enabled or settings.test_mode == settings.pilot_mode: raise ValueError('isolated mode required')
   self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._now=now or datetime(2026,1,1,tzinfo=timezone.utc); self.auth=WorkerAuthService(self.store,self.now)
  def now(self): return self._now.isoformat().replace('+00:00','Z')
  def advance_for_test(self, seconds): self._now += timedelta(seconds=seconds)
@@ -37,18 +37,22 @@ class WorkerControlPlaneService:
   c.execute("INSERT INTO worker_audit_log(occurred_at,event_type,worker_id,instance_id,registration_id,task_id,delivery_id,trace_id,outcome,reason_code) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.now(),event,safe.get('worker_id'),safe.get('instance_id'),safe.get('registration_id'),safe.get('task_id'),safe.get('delivery_id'),safe.get('trace_id'),safe.get('outcome','ok'),safe.get('reason_code')))
  def record_rejection(self,event,**fields):
   with self.store.transaction() as c: self._audit(c,event,outcome='rejected',**fields)
- def seed_test_worker(self):
-  if not self.settings.test_mode: raise RuntimeError('test mode required')
+ def provision_worker(self):
+  if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
   secret=__import__('secrets').token_urlsafe(32); salt,digest=bootstrap_record(secret)
   with self.store.transaction() as c:
-   c.execute("INSERT OR REPLACE INTO workers(worker_id,worker_name,allowed_capabilities,enabled) VALUES(?,?,?,1)",('server-a-worker','test worker','[\"system.echo\"]'))
-   c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),'server-a-worker','bootstrap',digest,salt,self.now(),None,None)); self._audit(c,'test_worker_seeded',worker_id='server-a-worker')
+   c.execute("INSERT INTO workers(worker_id,worker_name,allowed_capabilities,enabled,revoked_at) VALUES(?,?,?,1,NULL) ON CONFLICT(worker_id) DO UPDATE SET worker_name=excluded.worker_name,allowed_capabilities=excluded.allowed_capabilities,enabled=1,revoked_at=NULL",('server-a-worker','Hermes local pilot worker','[\"system.echo\"]'))
+   c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",(self.now(),'server-a-worker'))
+   c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),'server-a-worker','bootstrap',digest,salt,self.now(),None,None)); self._audit(c,'worker_provisioned',worker_id='server-a-worker')
   return secret
+ def seed_test_worker(self):
+  if not self.settings.test_mode: raise RuntimeError('test mode required')
+  return self.provision_worker()
  def revoke_test_worker(self):
   with self.store.transaction() as c:
    c.execute("UPDATE workers SET enabled=0,revoked_at=? WHERE worker_id='server-a-worker'",(self.now(),)); self._audit(c,'worker_revoked',worker_id='server-a-worker')
- def create_test_echo_task(self,payload,key):
-  if not self.settings.test_mode: raise RuntimeError('test mode required')
+ def enqueue_system_echo(self,payload,key):
+  if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
   payload=validate_system_echo_payload(payload,self.settings.max_stdout_bytes); task_id=str(uuid.uuid4()); trace=str(uuid.uuid4()); encoded=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(',',':'))
   with self.store.transaction() as c:
    existing=c.execute("SELECT task_id,payload_hash FROM worker_tasks WHERE creation_idempotency_key=?",(key,)).fetchone()
@@ -58,6 +62,9 @@ class WorkerControlPlaneService:
     return existing['task_id']
    c.execute("INSERT INTO worker_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(task_id,'system.echo',encoded,h,'queued',self.now(),self.now(),None,0,self.settings.max_attempts,key,trace)); self._audit(c,'test_task_created',task_id=task_id,trace_id=trace)
   return task_id
+ def create_test_echo_task(self,payload,key):
+  if not self.settings.test_mode: raise RuntimeError('test mode required')
+  return self.enqueue_system_echo(payload,key)
  def register_worker(self,d,secret):
   if d.get('protocol_version')!='1.0': raise error('unsupported_protocol')
   if d.get('worker_id')!='server-a-worker' or d.get('capabilities') != ['system.echo']: raise error('unsupported_capability' if d.get('worker_id')=='server-a-worker' else 'invalid_credential')

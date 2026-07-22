@@ -1,4 +1,4 @@
-"""Standalone aiohttp application factory; tests alone mount this app."""
+"""Standalone aiohttp app factory for tests and the loopback-only pilot."""
 from __future__ import annotations
 
 import uuid
@@ -94,8 +94,8 @@ def _failure(exc: WorkerControlPlaneError) -> web.Response:
     return web.json_response({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable, "trace_id": str(uuid.uuid4())}}, status=exc.status)
 
 def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, service: WorkerControlPlaneService | None = None) -> web.Application:
-    if not settings.enabled or not settings.test_mode:
-        raise ValueError("Worker Control Plane is test-only in M2B-1")
+    if not settings.enabled or settings.test_mode == settings.pilot_mode:
+        raise ValueError("Worker Control Plane requires one isolated mode")
     svc = service or WorkerControlPlaneService(settings)
     app = web.Application(client_max_size=settings.max_body_bytes)
     app[SERVICE_KEY] = svc
