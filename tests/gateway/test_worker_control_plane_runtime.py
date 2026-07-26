@@ -11,7 +11,7 @@ import stat
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from threading import Barrier
+from threading import Event, Lock
 
 import pytest
 from aiohttp import ClientSession
@@ -1021,6 +1021,136 @@ def _create_legacy_database(
     }
 
 
+def _create_v2_database(path):
+    secret = "v2-legacy-secret"
+    bootstrap_id = "00000000-0000-4000-8000-000000000201"
+    access_id = "00000000-0000-4000-8000-000000000202"
+    registration_id = "00000000-0000-4000-8000-000000000203"
+    instance_id = "00000000-0000-4000-8000-000000000204"
+    salt, digest = bootstrap_record(secret)
+    migrations = (
+        ("worker_control_plane_schema_v1", "2026-07-22 11:57:47"),
+        (
+            "worker_control_plane_bootstrap_lifecycle_v2",
+            "2026-07-26 09:55:01",
+        ),
+    )
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.executescript(
+        """
+        CREATE TABLE schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE workers(worker_id TEXT PRIMARY KEY, worker_name TEXT NOT NULL, allowed_capabilities TEXT NOT NULL, enabled INTEGER NOT NULL, revoked_at TEXT);
+        CREATE TABLE worker_credentials(credential_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id), kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, salt TEXT, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, single_use INTEGER NOT NULL DEFAULT 0 CHECK(single_use IN (0,1)), consumed_at TEXT);
+        CREATE TABLE worker_instances(registration_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id), instance_id TEXT NOT NULL, status TEXT NOT NULL, worker_version TEXT NOT NULL, protocol_version TEXT NOT NULL, registered_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, access_credential_id TEXT NOT NULL REFERENCES worker_credentials(credential_id), current_task_id TEXT, UNIQUE(worker_id, instance_id));
+        CREATE TABLE worker_tasks(task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL CHECK(task_type='system.echo'), payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, available_at TEXT NOT NULL, leased_until TEXT, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL, creation_idempotency_key TEXT NOT NULL UNIQUE, trace_id TEXT NOT NULL);
+        CREATE TABLE worker_deliveries(delivery_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES worker_tasks(task_id), worker_id TEXT NOT NULL, registration_id TEXT NOT NULL REFERENCES worker_instances(registration_id), attempt INTEGER NOT NULL, state TEXT NOT NULL, leased_at TEXT NOT NULL, ack_deadline_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, acknowledged_at TEXT, finished_at TEXT, UNIQUE(task_id, attempt));
+        CREATE TABLE worker_results(result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES worker_tasks(task_id), delivery_id TEXT NOT NULL UNIQUE REFERENCES worker_deliveries(delivery_id), result_idempotency_key TEXT NOT NULL, result_hash TEXT NOT NULL, status TEXT NOT NULL, stdout TEXT NOT NULL, stderr TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, finished_at TEXT NOT NULL, duration_ms INTEGER NOT NULL, accepted_at TEXT NOT NULL, UNIQUE(task_id, result_idempotency_key));
+        CREATE TABLE worker_request_dedup(worker_id TEXT NOT NULL, registration_id TEXT NOT NULL, method TEXT NOT NULL, route TEXT NOT NULL, task_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_body_hash TEXT NOT NULL, response_status INTEGER NOT NULL, response_json TEXT NOT NULL, PRIMARY KEY(worker_id, idempotency_key));
+        CREATE TABLE worker_audit_log(audit_id INTEGER PRIMARY KEY, occurred_at TEXT NOT NULL, event_type TEXT NOT NULL, worker_id TEXT, instance_id TEXT, registration_id TEXT, task_id TEXT, delivery_id TEXT, trace_id TEXT, outcome TEXT NOT NULL, reason_code TEXT, details_json TEXT);
+        CREATE INDEX idx_tasks_queue ON worker_tasks(state,available_at,created_at);
+        CREATE INDEX idx_deliveries_lease ON worker_deliveries(state,lease_expires_at);
+        """
+    )
+    connection.executemany(
+        "INSERT INTO schema_migrations VALUES(?,?)", migrations
+    )
+    connection.execute(
+        "INSERT INTO workers VALUES(?,?,?,1,NULL)",
+        ("server-a-worker", "v2 worker", '["system.echo"]'),
+    )
+    connection.execute(
+        "INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+        (
+            bootstrap_id,
+            "server-a-worker",
+            "bootstrap",
+            digest,
+            salt,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            None,
+            1,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?,0,NULL)",
+        (
+            access_id,
+            "server-a-worker",
+            "access",
+            hashlib.sha256(b"v2-access-token").hexdigest(),
+            None,
+            "2026-01-01T00:00:00Z",
+            "2099-01-01T00:00:00Z",
+            None,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+        (
+            registration_id,
+            "server-a-worker",
+            instance_id,
+            "active",
+            "0.2.0",
+            "1.0",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            access_id,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_audit_log("
+        "audit_id,occurred_at,event_type,worker_id,instance_id,"
+        "registration_id,outcome,reason_code"
+        ") VALUES(1,?,?,?,?,?,?,?)",
+        (
+            "2026-01-01T00:00:00Z",
+            "worker_registered",
+            "server-a-worker",
+            instance_id,
+            registration_id,
+            "ok",
+            "v2-fixture",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    path.chmod(0o600)
+    return {
+        "secret": secret,
+        "bootstrap_id": bootstrap_id,
+        "access_id": access_id,
+        "registration_id": registration_id,
+        "instance_id": instance_id,
+        "migrations": migrations,
+    }
+
+
+def _v2_business_snapshot(path, connect=sqlite3.connect):
+    connection = connect(path)
+    credentials = connection.execute(
+        "SELECT credential_id,worker_id,kind,token_hash,salt,issued_at,"
+        "expires_at,revoked_at,single_use,consumed_at "
+        "FROM worker_credentials ORDER BY credential_id"
+    ).fetchall()
+    registrations = connection.execute(
+        "SELECT * FROM worker_instances ORDER BY registration_id"
+    ).fetchall()
+    audit = connection.execute(
+        "SELECT * FROM worker_audit_log ORDER BY audit_id"
+    ).fetchall()
+    secret_material = hashlib.sha256(
+        json.dumps(
+            [(row[0], row[3], row[4]) for row in credentials],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    connection.close()
+    return credentials, registrations, audit, secret_material
+
+
 def _legacy_business_snapshot(path, connect=sqlite3.connect):
     connection = connect(path)
     credentials = connection.execute(
@@ -1059,6 +1189,52 @@ class _FailingMigrationConnection:
     def execute(self, statement, parameters=()):
         if self._should_fail(" ".join(statement.split()), parameters):
             raise sqlite3.OperationalError("injected migration failure")
+        return self._connection.execute(statement, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class _ContendedMigrationConnection:
+    def __init__(
+        self,
+        connection,
+        role,
+        lock_held,
+        contender_attempted,
+        release_lock,
+        alter_statements,
+        statements_lock,
+    ):
+        self._connection = connection
+        self._role = role
+        self._lock_held = lock_held
+        self._contender_attempted = contender_attempted
+        self._release_lock = release_lock
+        self._alter_statements = alter_statements
+        self._statements_lock = statements_lock
+
+    @property
+    def row_factory(self):
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._connection.row_factory = value
+
+    def execute(self, statement, parameters=()):
+        normalized = " ".join(statement.split())
+        if normalized == "BEGIN IMMEDIATE":
+            if self._role == "a":
+                cursor = self._connection.execute(statement, parameters)
+                self._lock_held.set()
+                if not self._release_lock.wait(timeout=5):
+                    raise AssertionError("migration lock release timed out")
+                return cursor
+            self._contender_attempted.set()
+        if normalized.startswith("ALTER TABLE"):
+            with self._statements_lock:
+                self._alter_statements.append(normalized)
         return self._connection.execute(statement, parameters)
 
     def __getattr__(self, name):
@@ -1146,6 +1322,170 @@ def test_real_legacy_rows_are_preserved_and_future_expiry_fails_closed(
         assert legacy["secret"] not in migration_metadata
     finally:
         service.close()
+
+
+def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    legacy = _create_v2_database(settings.db_path)
+    before = _v2_business_snapshot(settings.db_path)
+    connection = sqlite3.connect(settings.db_path)
+    v2_columns = [
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(worker_credentials)"
+        )
+    ]
+    connection.close()
+
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    try:
+        columns = [
+            row["name"]
+            for row in service.store.conn.execute(
+                "PRAGMA table_info(worker_credentials)"
+            )
+        ]
+        assert columns == [*v2_columns, "lifecycle_version"]
+        migrations = {
+            row["version"]: row["applied_at"]
+            for row in service.store.conn.execute(
+                "SELECT version,applied_at FROM schema_migrations"
+            )
+        }
+        assert len(migrations) == 3
+        assert tuple(
+            (name, migrations[name]) for name, _ in legacy["migrations"]
+        ) == legacy["migrations"]
+        assert wcp_storage.LIFECYCLE_MIGRATION_V3 in migrations
+        assert _v2_business_snapshot(settings.db_path) == before
+
+        credentials = service.store.conn.execute(
+            "SELECT credential_id,lifecycle_version FROM worker_credentials "
+            "ORDER BY credential_id"
+        ).fetchall()
+        assert {row["credential_id"] for row in credentials} == {
+            legacy["bootstrap_id"],
+            legacy["access_id"],
+        }
+        assert {row["lifecycle_version"] for row in credentials} == {0}
+        registration = service.store.conn.execute(
+            "SELECT * FROM worker_instances WHERE registration_id=?",
+            (legacy["registration_id"],),
+        ).fetchone()
+        assert registration["instance_id"] == legacy["instance_id"]
+
+        access_count = service.store.conn.execute(
+            "SELECT count(*) FROM worker_credentials WHERE kind='access'"
+        ).fetchone()[0]
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(legacy["instance_id"]), legacy["secret"]
+            )
+        assert (exc.value.code, exc.value.status) == (
+            "invalid_credential",
+            401,
+        )
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_credentials WHERE kind='access'"
+        ).fetchone()[0] == access_count
+
+        service.revoke_bootstrap_credential(
+            "server-a-worker", legacy["bootstrap_id"]
+        )
+        legacy_before_provision = tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_credentials WHERE credential_id=?",
+                (legacy["bootstrap_id"],),
+            ).fetchone()
+        )
+        provisioned = service.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+        legacy_after_provision = tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_credentials WHERE credential_id=?",
+                (legacy["bootstrap_id"],),
+            ).fetchone()
+        )
+        assert legacy_after_provision == legacy_before_provision
+        new_row = service.store.conn.execute(
+            "SELECT * FROM worker_credentials WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()
+        assert new_row["lifecycle_version"] == 3
+        assert new_row["single_use"] == 1
+        issued = datetime.fromisoformat(
+            new_row["issued_at"].replace("Z", "+00:00")
+        )
+        expires = datetime.fromisoformat(
+            new_row["expires_at"].replace("Z", "+00:00")
+        )
+        assert expires - issued == timedelta(seconds=900)
+
+        assert service.register_worker(
+            _registration_body(legacy["instance_id"]),
+            provisioned["secret"],
+        )[0] == 200
+        consumed = service.store.conn.execute(
+            "SELECT consumed_at,revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()
+        assert consumed["consumed_at"] is not None
+        assert consumed["revoked_at"] == consumed["consumed_at"]
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(legacy["instance_id"]),
+                provisioned["secret"],
+            )
+        assert (exc.value.code, exc.value.status) == (
+            "invalid_credential",
+            401,
+        )
+        service.check_health()
+        before_reopen = tuple(
+            tuple(row)
+            for table in (
+                "schema_migrations",
+                "worker_credentials",
+                "worker_instances",
+                "worker_audit_log",
+            )
+            for row in service.store.conn.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        applied_at = migrations
+    finally:
+        service.close()
+
+    reopened = pilot.WorkerControlPlaneService(settings, clock=clock)
+    try:
+        after_reopen = tuple(
+            tuple(row)
+            for table in (
+                "schema_migrations",
+                "worker_credentials",
+                "worker_instances",
+                "worker_audit_log",
+            )
+            for row in reopened.store.conn.execute(
+                f"SELECT * FROM {table} ORDER BY rowid"
+            )
+        )
+        assert after_reopen == before_reopen
+        second_applied_at = {
+            row["version"]: row["applied_at"]
+            for row in reopened.store.conn.execute(
+                "SELECT version,applied_at FROM schema_migrations"
+            )
+        }
+        assert second_applied_at == applied_at
+        assert len(second_applied_at) == 3
+        reopened.check_health()
+    finally:
+        reopened.close()
 
 
 def test_second_migration_run_does_not_rewrite_schema_data_or_applied_at(
@@ -1238,22 +1578,51 @@ def test_migration_failure_rolls_back_schema_metadata_and_business_rows(
     ) == before
 
 
-def test_concurrent_legacy_migration_serializes_and_preserves_rows(tmp_path):
+def test_concurrent_v2_migration_deterministically_contends_for_lock(
+    tmp_path, monkeypatch
+):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
-    _create_legacy_database(settings.db_path)
-    before = _legacy_business_snapshot(settings.db_path)
-    barrier = Barrier(2)
+    _create_v2_database(settings.db_path)
+    before = _v2_business_snapshot(settings.db_path)
+    real_connect = sqlite3.connect
+    lock_held = Event()
+    contender_attempted = Event()
+    release_lock = Event()
+    assignments_lock = Lock()
+    statements_lock = Lock()
+    roles = iter(("a", "b"))
+    alter_statements = []
 
-    def initialize(_):
-        barrier.wait()
+    def connect(*args, **kwargs):
+        with assignments_lock:
+            role = next(roles)
+        return _ContendedMigrationConnection(
+            real_connect(*args, **kwargs),
+            role,
+            lock_held,
+            contender_attempted,
+            release_lock,
+            alter_statements,
+            statements_lock,
+        )
+
+    def initialize():
         service = pilot.WorkerControlPlaneService(settings)
         service.close()
         return True
 
+    monkeypatch.setattr(wcp_storage.sqlite3, "connect", connect)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        assert list(executor.map(initialize, range(2))) == [True, True]
+        first = executor.submit(initialize)
+        assert lock_held.wait(timeout=5)
+        second = executor.submit(initialize)
+        assert contender_attempted.wait(timeout=5)
+        assert not second.done()
+        release_lock.set()
+        assert first.result(timeout=5) is True
+        assert second.result(timeout=5) is True
 
-    connection = sqlite3.connect(settings.db_path)
+    connection = real_connect(settings.db_path)
     columns = {
         row[1]
         for row in connection.execute(
@@ -1265,12 +1634,18 @@ def test_concurrent_legacy_migration_serializes_and_preserves_rows(tmp_path):
         "consumed_at",
         "lifecycle_version",
     } <= columns
+    assert alter_statements == [
+        "ALTER TABLE worker_credentials ADD COLUMN lifecycle_version "
+        "INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_version IN (0,3))"
+    ]
     assert connection.execute(
         "SELECT count(*) FROM schema_migrations WHERE version=?",
         (wcp_storage.LIFECYCLE_MIGRATION_V3,),
     ).fetchone()[0] == 1
     connection.close()
-    assert _legacy_business_snapshot(settings.db_path) == before
+    assert _v2_business_snapshot(
+        settings.db_path, connect=real_connect
+    ) == before
 
 
 @pytest.mark.parametrize(
