@@ -31,11 +31,12 @@ class WorkerAuthService:
   if expiry.tzinfo is None or expiry.astimezone(timezone.utc)<=self.now_datetime(): raise error('invalid_credential')
   return row
  def access(self, token):
-  rows=self.store.conn.execute("SELECT c.worker_id,c.credential_id,c.token_hash,c.expires_at,c.revoked_at,w.enabled,i.instance_id,i.registration_id,i.status FROM worker_credentials c JOIN workers w USING(worker_id) JOIN worker_instances i ON i.access_credential_id=c.credential_id WHERE c.kind='access'").fetchall()
+  rows=self.store.conn.execute("SELECT c.worker_id,c.credential_id,c.token_hash,c.expires_at,c.revoked_at,c.consumed_at,c.lifecycle_version,w.enabled,i.instance_id,i.registration_id,i.status FROM worker_credentials c JOIN workers w USING(worker_id) JOIN worker_instances i ON i.access_credential_id=c.credential_id AND i.worker_id=c.worker_id WHERE c.kind='access'").fetchall()
   row=next((candidate for candidate in rows if verify_access_token(token,candidate['token_hash'])),None)
   if row is None: raise error('invalid_credential')
+  if row['lifecycle_version']!=CURRENT_LIFECYCLE_VERSION or row['consumed_at'] is not None: raise error('invalid_credential')
   if not row['enabled'] or row['revoked_at']: raise error('worker_revoked')
-  if row['expires_at'] <= self.now(): raise error('invalid_credential')
+  if not isinstance(row['expires_at'],str) or row['expires_at'] <= self.now(): raise error('invalid_credential')
   if row['status'] != 'active': raise error('registration_expired')
   return row
 

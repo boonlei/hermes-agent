@@ -122,6 +122,14 @@ async def test_real_loopback_http_system_echo_lifecycle(tmp_path):
             registration = await response.json()
             registration_id = registration["registration_id"]
             access_token = registration["access_token"]
+            assert runtime.service is not None
+            assert runtime.service.store.conn.execute(
+                "SELECT c.lifecycle_version FROM worker_credentials c "
+                "JOIN worker_instances i "
+                "ON i.access_credential_id=c.credential_id "
+                "WHERE i.registration_id=?",
+                (registration_id,),
+            ).fetchone()[0] == wcp_storage.CURRENT_LIFECYCLE_VERSION
             headers = {"Authorization": f"Bearer {access_token}"}
             identity = {
                 "worker_id": worker_id,
@@ -1151,6 +1159,75 @@ def _v2_business_snapshot(path, connect=sqlite3.connect):
     return credentials, registrations, audit, secret_material
 
 
+def _migrated_v2_snapshot(connection, *, include_audit=True):
+    credentials = connection.execute(
+        "SELECT credential_id,worker_id,kind,issued_at,expires_at,revoked_at,"
+        "single_use,consumed_at,lifecycle_version "
+        "FROM worker_credentials ORDER BY credential_id"
+    ).fetchall()
+    secret_material = connection.execute(
+        "SELECT credential_id,token_hash,salt FROM worker_credentials "
+        "ORDER BY credential_id"
+    ).fetchall()
+    snapshot = {
+        "workers": tuple(
+            tuple(row)
+            for row in connection.execute("SELECT * FROM workers ORDER BY worker_id")
+        ),
+        "credentials": tuple(tuple(row) for row in credentials),
+        "credential_ids": tuple(row["credential_id"] for row in credentials),
+        "credential_count": len(credentials),
+        "secret_material_sha256": hashlib.sha256(
+            json.dumps(
+                [tuple(row) for row in secret_material],
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+        "access_credential_ids": tuple(
+            row["credential_id"] for row in credentials if row["kind"] == "access"
+        ),
+        "registrations": tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM worker_instances ORDER BY registration_id"
+            )
+        ),
+        "tasks": tuple(
+            tuple(row)
+            for row in connection.execute("SELECT * FROM worker_tasks ORDER BY task_id")
+        ),
+        "deliveries": tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM worker_deliveries ORDER BY delivery_id"
+            )
+        ),
+        "results": tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM worker_results ORDER BY result_id"
+            )
+        ),
+        "dedup": tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM worker_request_dedup "
+                "ORDER BY worker_id,idempotency_key"
+            )
+        ),
+    }
+    if include_audit:
+        snapshot["audit"] = tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT audit_id,occurred_at,event_type,worker_id,instance_id,"
+                "registration_id,task_id,delivery_id,trace_id,outcome,"
+                "reason_code,details_json FROM worker_audit_log ORDER BY audit_id"
+            )
+        )
+    return snapshot
+
+
 def _legacy_business_snapshot(path, connect=sqlite3.connect):
     connection = connect(path)
     credentials = connection.execute(
@@ -1199,18 +1276,12 @@ class _ContendedMigrationConnection:
     def __init__(
         self,
         connection,
-        role,
-        lock_held,
-        contender_attempted,
-        release_lock,
+        begin_locked,
         alter_statements,
         statements_lock,
     ):
         self._connection = connection
-        self._role = role
-        self._lock_held = lock_held
-        self._contender_attempted = contender_attempted
-        self._release_lock = release_lock
+        self._begin_locked = begin_locked
         self._alter_statements = alter_statements
         self._statements_lock = statements_lock
 
@@ -1224,18 +1295,15 @@ class _ContendedMigrationConnection:
 
     def execute(self, statement, parameters=()):
         normalized = " ".join(statement.split())
-        if normalized == "BEGIN IMMEDIATE":
-            if self._role == "a":
-                cursor = self._connection.execute(statement, parameters)
-                self._lock_held.set()
-                if not self._release_lock.wait(timeout=5):
-                    raise AssertionError("migration lock release timed out")
-                return cursor
-            self._contender_attempted.set()
         if normalized.startswith("ALTER TABLE"):
             with self._statements_lock:
                 self._alter_statements.append(normalized)
-        return self._connection.execute(statement, parameters)
+        try:
+            return self._connection.execute(statement, parameters)
+        except sqlite3.OperationalError as exc:
+            if normalized == "BEGIN IMMEDIATE" and "locked" in str(exc).lower():
+                self._begin_locked.set()
+            raise
 
     def __getattr__(self, name):
         return getattr(self._connection, name)
@@ -1375,20 +1443,34 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
         ).fetchone()
         assert registration["instance_id"] == legacy["instance_id"]
 
-        access_count = service.store.conn.execute(
-            "SELECT count(*) FROM worker_credentials WHERE kind='access'"
-        ).fetchone()[0]
+        authentication_before = _migrated_v2_snapshot(service.store.conn)
         with pytest.raises(WorkerControlPlaneError) as exc:
             service.register_worker(
                 _registration_body(legacy["instance_id"]), legacy["secret"]
             )
-        assert (exc.value.code, exc.value.status) == (
-            "invalid_credential",
-            401,
+        assert (
+            exc.value.code,
+            exc.value.status,
+            exc.value.message,
+        ) == ("invalid_credential", 401, "Authentication failed")
+        rendered_error = json.dumps(
+            {
+                "code": exc.value.code,
+                "status": exc.value.status,
+                "message": exc.value.message,
+            }
+        ).lower()
+        assert all(
+            forbidden not in rendered_error
+            for forbidden in (
+                "legacy",
+                "lifecycle_version",
+                "migration",
+                "eligibility",
+                legacy["bootstrap_id"].lower(),
+            )
         )
-        assert service.store.conn.execute(
-            "SELECT count(*) FROM worker_credentials WHERE kind='access'"
-        ).fetchone()[0] == access_count
+        assert _migrated_v2_snapshot(service.store.conn) == authentication_before
 
         service.revoke_bootstrap_credential(
             "server-a-worker", legacy["bootstrap_id"]
@@ -1486,6 +1568,151 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
         reopened.check_health()
     finally:
         reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_migrated_v2_access_is_rejected_by_all_worker_endpoints(
+    tmp_path,
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    legacy = _create_v2_database(settings.db_path)
+    port = unused_port()
+    runtime = pilot.LocalPilotRuntime(settings, port)
+    await runtime.start()
+    assert runtime.service is not None
+    service = runtime.service
+    before = _migrated_v2_snapshot(service.store.conn, include_audit=False)
+    audit_before = service.store.conn.execute(
+        "SELECT coalesce(max(audit_id),0) FROM worker_audit_log"
+    ).fetchone()[0]
+    task_id = "00000000-0000-4000-8000-000000000205"
+    delivery_id = "00000000-0000-4000-8000-000000000206"
+    identity = {
+        "worker_id": "server-a-worker",
+        "instance_id": legacy["instance_id"],
+        "registration_id": legacy["registration_id"],
+    }
+    requests = (
+        (
+            "/worker/v1/heartbeat",
+            {},
+            identity
+            | {
+                "status": "idle",
+                "current_task_id": None,
+                "worker_time": "2026-01-01T00:00:00Z",
+            },
+            "heartbeat_rejected",
+        ),
+        (
+            "/worker/v1/tasks/poll",
+            {"Idempotency-Key": "legacy-poll"},
+            identity
+            | {
+                "capabilities": ["system.echo"],
+                "max_tasks": 1,
+                "wait_seconds": 0,
+            },
+            "poll_rejected",
+        ),
+        (
+            f"/worker/v1/tasks/{task_id}/ack",
+            {"Idempotency-Key": "legacy-ack"},
+            identity
+            | {
+                "delivery_id": delivery_id,
+                "accepted": True,
+                "reason": None,
+                "worker_time": "2026-01-01T00:00:00Z",
+            },
+            "ack_rejected",
+        ),
+        (
+            f"/worker/v1/tasks/{task_id}/result",
+            {"Idempotency-Key": "legacy-result"},
+            identity
+            | {
+                "delivery_id": delivery_id,
+                "task_id": task_id,
+                "task_type": "system.echo",
+                "status": "completed",
+                "stdout": "legacy-result-must-not-run",
+                "stderr": "",
+                "exit_code": 0,
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:00Z",
+                "duration_ms": 0,
+                "result_idempotency_key": "legacy-result-body",
+                "payload_hash": "0" * 64,
+                "trace_id": "00000000-0000-4000-8000-000000000207",
+            },
+            "result_rejected",
+        ),
+    )
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        async with ClientSession() as client:
+            for path, extra_headers, body, _ in requests:
+                response = await client.post(
+                    base_url + path,
+                    headers={
+                        "Authorization": "Bearer v2-access-token",
+                        **extra_headers,
+                    },
+                    json=body,
+                )
+                payload = await response.json()
+                assert response.status == 401
+                assert payload["error"]["code"] == "invalid_credential"
+                assert payload["error"]["message"] == "Authentication failed"
+                rendered = json.dumps(payload).lower()
+                assert all(
+                    forbidden not in rendered
+                    for forbidden in (
+                        "legacy",
+                        "lifecycle_version",
+                        "migration",
+                        "eligibility",
+                        legacy["access_id"].lower(),
+                        "v2-access-token",
+                    )
+                )
+                assert (
+                    _migrated_v2_snapshot(
+                        service.store.conn, include_audit=False
+                    )
+                    == before
+                )
+
+        rejection_audit = service.store.conn.execute(
+            "SELECT event_type,outcome,reason_code,details_json "
+            "FROM worker_audit_log WHERE audit_id>? ORDER BY audit_id",
+            (audit_before,),
+        ).fetchall()
+        assert [tuple(row) for row in rejection_audit] == [
+            event
+            for _, _, _, rejected_event in requests
+            for event in (
+                (rejected_event, "rejected", "invalid_credential", None),
+                ("credential_failed", "rejected", "invalid_credential", None),
+            )
+        ]
+        rendered_audit = json.dumps(
+            [tuple(row) for row in rejection_audit]
+        ).lower()
+        assert all(
+            forbidden not in rendered_audit
+            for forbidden in (
+                "legacy",
+                "lifecycle_version",
+                "migration",
+                "eligibility",
+                legacy["access_id"].lower(),
+                "v2-access-token",
+            )
+        )
+    finally:
+        await runtime.stop()
 
 
 def test_second_migration_run_does_not_rewrite_schema_data_or_applied_at(
@@ -1586,22 +1813,27 @@ def test_concurrent_v2_migration_deterministically_contends_for_lock(
     before = _v2_business_snapshot(settings.db_path)
     real_connect = sqlite3.connect
     lock_held = Event()
-    contender_attempted = Event()
+    begin_locked = Event()
     release_lock = Event()
-    assignments_lock = Lock()
     statements_lock = Lock()
-    roles = iter(("a", "b"))
     alter_statements = []
 
+    def hold_write_lock():
+        connection = real_connect(settings.db_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            lock_held.set()
+            if not release_lock.wait(timeout=5):
+                raise AssertionError("migration lock release timed out")
+            connection.rollback()
+        finally:
+            connection.close()
+
     def connect(*args, **kwargs):
-        with assignments_lock:
-            role = next(roles)
+        kwargs["timeout"] = 0
         return _ContendedMigrationConnection(
             real_connect(*args, **kwargs),
-            role,
-            lock_held,
-            contender_attempted,
-            release_lock,
+            begin_locked,
             alter_statements,
             statements_lock,
         )
@@ -1613,14 +1845,30 @@ def test_concurrent_v2_migration_deterministically_contends_for_lock(
 
     monkeypatch.setattr(wcp_storage.sqlite3, "connect", connect)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(initialize)
+        first = executor.submit(hold_write_lock)
         assert lock_held.wait(timeout=5)
         second = executor.submit(initialize)
-        assert contender_attempted.wait(timeout=5)
-        assert not second.done()
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            second.result(timeout=5)
+        assert begin_locked.is_set()
+        assert not first.done()
         release_lock.set()
-        assert first.result(timeout=5) is True
-        assert second.result(timeout=5) is True
+        assert first.result(timeout=5) is None
+
+    connection = real_connect(settings.db_path)
+    assert "lifecycle_version" not in {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(worker_credentials)"
+        )
+    }
+    assert connection.execute(
+        "SELECT count(*) FROM schema_migrations WHERE version=?",
+        (wcp_storage.LIFECYCLE_MIGRATION_V3,),
+    ).fetchone()[0] == 0
+    connection.close()
+
+    assert initialize() is True
 
     connection = real_connect(settings.db_path)
     columns = {
