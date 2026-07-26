@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import os
 import sqlite3
@@ -10,12 +11,14 @@ import stat
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Barrier
 
 import pytest
 from aiohttp import ClientSession
 from aiohttp.test_utils import unused_port
 
 from gateway.worker_control_plane import runtime as pilot
+from gateway.worker_control_plane import storage as wcp_storage
 from gateway.worker_control_plane.auth import bootstrap_record
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
 from gateway.worker_control_plane.errors import WorkerControlPlaneError
@@ -685,7 +688,8 @@ def test_valid_bootstrap_is_consumed_once_after_successful_register(tmp_path):
         )
         assert status == 201
         row = service.store.conn.execute(
-            "SELECT expires_at,single_use,consumed_at,revoked_at "
+            "SELECT expires_at,single_use,consumed_at,revoked_at,"
+            "lifecycle_version "
             "FROM worker_credentials WHERE credential_id=?",
             (provisioned["credential_id"],),
         ).fetchone()
@@ -697,6 +701,10 @@ def test_valid_bootstrap_is_consumed_once_after_successful_register(tmp_path):
         )
         assert expires - issued == timedelta(minutes=15)
         assert row["single_use"] == 1
+        assert (
+            row["lifecycle_version"]
+            == wcp_storage.CURRENT_LIFECYCLE_VERSION
+        )
         assert row["consumed_at"] is not None
         assert row["revoked_at"] == row["consumed_at"]
 
@@ -916,55 +924,389 @@ def test_bootstrap_ttl_is_bounded_before_file_or_db_creation(tmp_path, ttl):
         service.close()
 
 
-def test_legacy_schema_is_migrated_and_null_expiry_is_rejected(tmp_path):
-    settings = pilot.pilot_test_settings(tmp_path / "pilot")
-    connection = sqlite3.connect(settings.db_path)
+def _create_legacy_database(
+    path,
+    *,
+    expires_at="2099-01-01T00:00:00Z",
+    revoked_at=None,
+):
+    secret = "legacy-secret"
+    bootstrap_id = str(uuid.uuid4())
+    access_id = str(uuid.uuid4())
+    registration_id = str(uuid.uuid4())
+    instance_id = str(uuid.uuid4())
+    salt, digest = bootstrap_record(secret)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.executescript(
+        """
+        CREATE TABLE schema_migrations(
+            version TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+        );
+        CREATE TABLE workers(
+            worker_id TEXT PRIMARY KEY, worker_name TEXT NOT NULL,
+            allowed_capabilities TEXT NOT NULL, enabled INTEGER NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE TABLE worker_credentials(
+            credential_id TEXT PRIMARY KEY,
+            worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+            kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, salt TEXT,
+            issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT
+        );
+        CREATE TABLE worker_instances(
+            registration_id TEXT PRIMARY KEY,
+            worker_id TEXT NOT NULL REFERENCES workers(worker_id),
+            instance_id TEXT NOT NULL, status TEXT NOT NULL,
+            worker_version TEXT NOT NULL, protocol_version TEXT NOT NULL,
+            registered_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+            access_credential_id TEXT NOT NULL
+                REFERENCES worker_credentials(credential_id),
+            current_task_id TEXT, UNIQUE(worker_id, instance_id)
+        );
+        """
+    )
     connection.execute(
-        "CREATE TABLE worker_credentials("
-        "credential_id TEXT PRIMARY KEY,worker_id TEXT NOT NULL,"
-        "kind TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,salt TEXT,"
-        "issued_at TEXT NOT NULL,expires_at TEXT,revoked_at TEXT)"
+        "INSERT INTO workers VALUES(?,?,?,1,NULL)",
+        ("server-a-worker", "legacy", '["system.echo"]'),
+    )
+    connection.execute(
+        "INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",
+        (
+            bootstrap_id,
+            "server-a-worker",
+            "bootstrap",
+            digest,
+            salt,
+            "2025-12-31T23:59:00Z",
+            expires_at,
+            revoked_at,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",
+        (
+            access_id,
+            "server-a-worker",
+            "access",
+            hashlib.sha256(b"legacy-access-token").hexdigest(),
+            None,
+            "2025-12-31T23:59:30Z",
+            "2099-01-01T00:00:00Z",
+            None,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,NULL)",
+        (
+            registration_id,
+            "server-a-worker",
+            instance_id,
+            "active",
+            "0.1.0",
+            "1.0",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            access_id,
+        ),
     )
     connection.commit()
     connection.close()
-    settings.db_path.chmod(0o600)
+    path.chmod(0o600)
+    return {
+        "secret": secret,
+        "bootstrap_id": bootstrap_id,
+        "access_id": access_id,
+        "registration_id": registration_id,
+    }
+
+
+def _legacy_business_snapshot(path, connect=sqlite3.connect):
+    connection = connect(path)
+    credentials = connection.execute(
+        "SELECT credential_id,worker_id,kind,token_hash,salt,issued_at,"
+        "expires_at,revoked_at FROM worker_credentials "
+        "ORDER BY credential_id"
+    ).fetchall()
+    registrations = connection.execute(
+        "SELECT registration_id,worker_id,instance_id,status,worker_version,"
+        "protocol_version,registered_at,last_seen_at,access_credential_id,"
+        "current_task_id FROM worker_instances ORDER BY registration_id"
+    ).fetchall()
+    secret_material = hashlib.sha256(
+        json.dumps(
+            [(row[0], row[3], row[4]) for row in credentials],
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    connection.close()
+    return credentials, registrations, secret_material
+
+
+class _FailingMigrationConnection:
+    def __init__(self, connection, should_fail):
+        self._connection = connection
+        self._should_fail = should_fail
+
+    @property
+    def row_factory(self):
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._connection.row_factory = value
+
+    def execute(self, statement, parameters=()):
+        if self._should_fail(" ".join(statement.split()), parameters):
+            raise sqlite3.OperationalError("injected migration failure")
+        return self._connection.execute(statement, parameters)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        columns = {
+            row["name"]: row
+            for row in service.store.conn.execute(
+                "PRAGMA table_info(worker_credentials)"
+            )
+        }
+        assert {
+            "single_use",
+            "consumed_at",
+            "lifecycle_version",
+        } <= columns.keys()
+        migrations = service.store.conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        assert [row[0] for row in migrations] == sorted(
+            {
+                "worker_control_plane_schema_v1",
+                "worker_control_plane_bootstrap_lifecycle_v2",
+                wcp_storage.LIFECYCLE_MIGRATION_V3,
+            }
+        )
+    finally:
+        service.close()
+
+
+def test_real_legacy_rows_are_preserved_and_future_expiry_fails_closed(
+    tmp_path, capsys
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    legacy = _create_legacy_database(settings.db_path)
+    before = _legacy_business_snapshot(settings.db_path)
 
     service = pilot.WorkerControlPlaneService(
         settings, clock=MutableClock()
     )
     try:
-        columns = {
-            row[1]
-            for row in service.store.conn.execute(
-                "PRAGMA table_info(worker_credentials)"
-            )
-        }
-        assert {"single_use", "consumed_at"} <= columns
-        service.store.conn.execute(
-            "INSERT INTO workers VALUES(?,?,?,1,NULL)",
-            ("server-a-worker", "legacy", '["system.echo"]'),
-        )
-        salt, digest = bootstrap_record("legacy-secret")
-        service.store.conn.execute(
-            "INSERT INTO worker_credentials("
-            "credential_id,worker_id,kind,token_hash,salt,issued_at,"
-            "expires_at,revoked_at,single_use,consumed_at"
-            ") VALUES(?,?,?,?,?,?,NULL,NULL,0,NULL)",
-            (
-                str(uuid.uuid4()),
-                "server-a-worker",
-                "bootstrap",
-                digest,
-                salt,
-                "2026-01-01T00:00:00Z",
-            ),
-        )
-        service.store.conn.commit()
+        after = _legacy_business_snapshot(settings.db_path)
+        assert after == before
+        versions = service.store.conn.execute(
+            "SELECT DISTINCT lifecycle_version FROM worker_credentials"
+        ).fetchall()
+        assert [row[0] for row in versions] == [0]
         with pytest.raises(WorkerControlPlaneError) as exc:
             service.register_worker(
-                _registration_body(str(uuid.uuid4())), "legacy-secret"
+                _registration_body(str(uuid.uuid4())), legacy["secret"]
             )
-        assert exc.value.code == "invalid_credential"
+        assert (exc.value.code, exc.value.status, exc.value.message) == (
+            "invalid_credential",
+            401,
+            "Authentication failed",
+        )
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_credentials"
+        ).fetchone()[0] == 2
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_instances"
+        ).fetchone()[0] == 1
+        metadata = service.list_bootstrap_credentials("server-a-worker")
+        assert metadata[0]["state"] == "legacy_ineligible"
+        assert metadata[0]["lifecycle_version"] == 0
+        rendered = json.dumps(metadata)
+        assert legacy["secret"] not in rendered
+        assert "token_hash" not in rendered
+        assert "salt" not in rendered
+        output = capsys.readouterr()
+        assert legacy["secret"] not in output.out + output.err
+        migration_metadata = json.dumps(
+            [
+                tuple(row)
+                for row in service.store.conn.execute(
+                    "SELECT * FROM schema_migrations"
+                )
+            ]
+        )
+        assert legacy["secret"] not in migration_metadata
+    finally:
+        service.close()
+
+
+def test_second_migration_run_does_not_rewrite_schema_data_or_applied_at(
+    tmp_path
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    _create_legacy_database(settings.db_path)
+    first = pilot.WorkerControlPlaneService(settings)
+    first.close()
+    connection = sqlite3.connect(settings.db_path)
+    before_schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+    ).fetchall()
+    before_metadata = connection.execute(
+        "SELECT version,applied_at FROM schema_migrations ORDER BY version"
+    ).fetchall()
+    before_business = _legacy_business_snapshot(settings.db_path)
+    connection.close()
+
+    second = pilot.WorkerControlPlaneService(settings)
+    second.close()
+    connection = sqlite3.connect(settings.db_path)
+    assert connection.execute(
+        "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+    ).fetchall() == before_schema
+    assert connection.execute(
+        "SELECT version,applied_at FROM schema_migrations ORDER BY version"
+    ).fetchall() == before_metadata
+    connection.close()
+    assert _legacy_business_snapshot(settings.db_path) == before_business
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ("after_first_ddl", "before_metadata", "metadata_v3"),
+)
+def test_migration_failure_rolls_back_schema_metadata_and_business_rows(
+    tmp_path, monkeypatch, failure_point
+):
+    settings = pilot.pilot_test_settings(tmp_path / failure_point)
+    legacy = _create_legacy_database(settings.db_path)
+    before = _legacy_business_snapshot(settings.db_path)
+    real_connect = sqlite3.connect
+    altered = 0
+
+    def should_fail(statement, parameters):
+        nonlocal altered
+        if statement.startswith("ALTER TABLE"):
+            altered += 1
+            if failure_point == "after_first_ddl" and altered == 2:
+                return True
+        if statement.startswith("INSERT OR IGNORE INTO schema_migrations"):
+            if failure_point == "before_metadata":
+                return True
+            if (
+                failure_point == "metadata_v3"
+                and parameters == (wcp_storage.LIFECYCLE_MIGRATION_V3,)
+            ):
+                return True
+        return False
+
+    def connect(*args, **kwargs):
+        return _FailingMigrationConnection(
+            real_connect(*args, **kwargs), should_fail
+        )
+
+    monkeypatch.setattr(wcp_storage.sqlite3, "connect", connect)
+    with pytest.raises(sqlite3.OperationalError) as exc:
+        pilot.WorkerControlPlaneService(settings)
+    assert legacy["secret"] not in str(exc.value)
+
+    connection = real_connect(settings.db_path)
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(worker_credentials)"
+        )
+    }
+    assert not {
+        "single_use",
+        "consumed_at",
+        "lifecycle_version",
+    } & columns
+    assert connection.execute(
+        "SELECT count(*) FROM schema_migrations"
+    ).fetchone()[0] == 0
+    connection.close()
+    assert _legacy_business_snapshot(
+        settings.db_path, connect=real_connect
+    ) == before
+
+
+def test_concurrent_legacy_migration_serializes_and_preserves_rows(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    _create_legacy_database(settings.db_path)
+    before = _legacy_business_snapshot(settings.db_path)
+    barrier = Barrier(2)
+
+    def initialize(_):
+        barrier.wait()
+        service = pilot.WorkerControlPlaneService(settings)
+        service.close()
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(initialize, range(2))) == [True, True]
+
+    connection = sqlite3.connect(settings.db_path)
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(worker_credentials)"
+        )
+    }
+    assert {
+        "single_use",
+        "consumed_at",
+        "lifecycle_version",
+    } <= columns
+    assert connection.execute(
+        "SELECT count(*) FROM schema_migrations WHERE version=?",
+        (wcp_storage.LIFECYCLE_MIGRATION_V3,),
+    ).fetchone()[0] == 1
+    connection.close()
+    assert _legacy_business_snapshot(settings.db_path) == before
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "revoked_at"),
+    (
+        (None, None),
+        ("2099-01-01T00:00:00Z", None),
+        ("not-a-timestamp", None),
+        ("2099-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+    ),
+)
+def test_all_legacy_bootstrap_variants_fail_closed(
+    tmp_path, expires_at, revoked_at
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    legacy = _create_legacy_database(
+        settings.db_path,
+        expires_at=expires_at,
+        revoked_at=revoked_at,
+    )
+    service = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    try:
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(str(uuid.uuid4())), legacy["secret"]
+            )
+        assert (exc.value.code, exc.value.status) == (
+            "invalid_credential",
+            401,
+        )
+        assert legacy["secret"] not in str(exc.value)
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_instances"
+        ).fetchone()[0] == 1
     finally:
         service.close()
 

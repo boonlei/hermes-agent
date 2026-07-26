@@ -7,7 +7,7 @@ from .auth import bootstrap_record, verify_bootstrap, new_access_token, verify_a
 from .config import WorkerControlPlaneSettings
 from .errors import error
 from .models import canonical_json_hash, validate_system_echo_payload
-from .storage import WorkerControlPlaneStore
+from .storage import CURRENT_LIFECYCLE_VERSION, WorkerControlPlaneStore
 
 _NO_REPLAY = object()
 
@@ -21,7 +21,7 @@ class WorkerAuthService:
    except (TypeError, ValueError):
     return False
   row=next((candidate for candidate in rows if matches(candidate)),None)
-  if not row or not row['enabled'] or row['revoked_at'] or row['consumed_at']: raise error('invalid_credential')
+  if not row or not row['enabled'] or row['revoked_at'] or row['consumed_at'] or row['lifecycle_version']!=CURRENT_LIFECYCLE_VERSION: raise error('invalid_credential')
   expires_at=row['expires_at']
   if not isinstance(expires_at,str): raise error('invalid_credential')
   try:
@@ -71,7 +71,7 @@ class WorkerControlPlaneService:
     c.execute("INSERT INTO workers(worker_id,worker_name,allowed_capabilities,enabled,revoked_at) VALUES(?,?,?,1,NULL) ON CONFLICT(worker_id) DO UPDATE SET worker_name=excluded.worker_name,allowed_capabilities=excluded.allowed_capabilities,enabled=1,revoked_at=NULL",('server-a-worker','Hermes local pilot worker','[\"system.echo\"]'))
     if c.execute("SELECT 1 FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",('server-a-worker',)).fetchone():
      raise ValueError('an unrevoked bootstrap credential already exists')
-    c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,NULL)",(credential_id,'server-a-worker','bootstrap',digest,salt,issued_at,expires_at,None,int(single_use))); self._audit(c,'worker_provisioned',worker_id='server-a-worker',reason_code=credential_id)
+    c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version) VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",(credential_id,'server-a-worker','bootstrap',digest,salt,issued_at,expires_at,None,int(single_use),CURRENT_LIFECYCLE_VERSION)); self._audit(c,'worker_provisioned',worker_id='server-a-worker',reason_code=credential_id)
     if install_credential is not None: rollback_file,finalize_file=install_credential()
   except Exception:
    if rollback_file is not None: rollback_file()
@@ -82,11 +82,12 @@ class WorkerControlPlaneService:
   if not self.settings.test_mode: raise RuntimeError('test mode required')
   return self.provision_worker()['secret']
  def list_bootstrap_credentials(self,worker_id):
-  rows=self.store.conn.execute("SELECT credential_id,worker_id,issued_at,expires_at,revoked_at,single_use,consumed_at FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' ORDER BY issued_at,credential_id",(worker_id,)).fetchall()
+  rows=self.store.conn.execute("SELECT credential_id,worker_id,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' ORDER BY issued_at,credential_id",(worker_id,)).fetchall()
   result=[]
   for row in rows:
    if row['consumed_at'] is not None: state='consumed'
    elif row['revoked_at'] is not None: state='revoked'
+   elif row['lifecycle_version']!=CURRENT_LIFECYCLE_VERSION: state='legacy_ineligible'
    elif row['expires_at'] is None: state='invalid'
    else:
     try:
@@ -94,7 +95,7 @@ class WorkerControlPlaneService:
      state='expired' if expiry.tzinfo is None or expiry.astimezone(timezone.utc)<=self._now_datetime() else 'active'
     except ValueError:
      state='invalid'
-   result.append({'credential_id':row['credential_id'],'worker_id':row['worker_id'],'issued_at':row['issued_at'],'expires_at':row['expires_at'],'single_use':bool(row['single_use']),'consumed_at':row['consumed_at'],'revoked_at':row['revoked_at'],'state':state})
+   result.append({'credential_id':row['credential_id'],'worker_id':row['worker_id'],'issued_at':row['issued_at'],'expires_at':row['expires_at'],'single_use':bool(row['single_use']),'consumed_at':row['consumed_at'],'revoked_at':row['revoked_at'],'lifecycle_version':row['lifecycle_version'],'state':state})
   return result
  def revoke_bootstrap_credential(self,worker_id,credential_id):
   with self.store.transaction() as c:
@@ -150,7 +151,7 @@ class WorkerControlPlaneService:
     c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=?",(self.now(),active['access_credential_id'])); rid=active['registration_id']; status=200; event='worker_reregistered'
    else:
     rid=str(uuid.uuid4()); status=201; event='worker_registered'
-   c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at) VALUES(?,?,?,?,?,?,?,?,0,NULL)",(cid,d['worker_id'],'access',thash,None,self.now(),expiry,None))
+   c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version) VALUES(?,?,?,?,?,?,?,?,0,NULL,?)",(cid,d['worker_id'],'access',thash,None,self.now(),expiry,None,CURRENT_LIFECYCLE_VERSION))
    if active: c.execute("UPDATE worker_instances SET access_credential_id=?,last_seen_at=? WHERE registration_id=?",(cid,self.now(),rid))
    else: c.execute("INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,d['worker_id'],iid,'active',d.get('worker_version','0'),d['protocol_version'],self.now(),self.now(),cid,None))
    if bootstrap['single_use']:
