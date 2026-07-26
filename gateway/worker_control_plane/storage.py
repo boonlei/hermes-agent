@@ -14,7 +14,7 @@ from .config import (
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workers(worker_id TEXT PRIMARY KEY, worker_name TEXT NOT NULL, allowed_capabilities TEXT NOT NULL, enabled INTEGER NOT NULL, revoked_at TEXT);
-CREATE TABLE IF NOT EXISTS worker_credentials(credential_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id), kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, salt TEXT, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT);
+CREATE TABLE IF NOT EXISTS worker_credentials(credential_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id), kind TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, salt TEXT, issued_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT, single_use INTEGER NOT NULL DEFAULT 0 CHECK(single_use IN (0,1)), consumed_at TEXT);
 CREATE TABLE IF NOT EXISTS worker_instances(registration_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL REFERENCES workers(worker_id), instance_id TEXT NOT NULL, status TEXT NOT NULL, worker_version TEXT NOT NULL, protocol_version TEXT NOT NULL, registered_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, access_credential_id TEXT NOT NULL REFERENCES worker_credentials(credential_id), current_task_id TEXT, UNIQUE(worker_id, instance_id));
 CREATE TABLE IF NOT EXISTS worker_tasks(task_id TEXT PRIMARY KEY, task_type TEXT NOT NULL CHECK(task_type='system.echo'), payload_json TEXT NOT NULL, payload_hash TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, available_at TEXT NOT NULL, leased_until TEXT, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL, creation_idempotency_key TEXT NOT NULL UNIQUE, trace_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS worker_deliveries(delivery_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES worker_tasks(task_id), worker_id TEXT NOT NULL, registration_id TEXT NOT NULL REFERENCES worker_instances(registration_id), attempt INTEGER NOT NULL, state TEXT NOT NULL, leased_at TEXT NOT NULL, ack_deadline_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, acknowledged_at TEXT, finished_at TEXT, UNIQUE(task_id, attempt));
@@ -46,7 +46,15 @@ class WorkerControlPlaneStore:
   self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA synchronous=FULL"); self.conn.execute("PRAGMA secure_delete=ON"); self.conn.execute("PRAGMA cell_size_check=ON")
   try: self.conn.execute("PRAGMA journal_mode=WAL")
   except sqlite3.DatabaseError: self.conn.execute("PRAGMA journal_mode=DELETE")
-  self.conn.executescript(SCHEMA); self.conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES('worker_control_plane_schema_v1',datetime('now'))"); self.conn.commit()
+  self.conn.executescript(SCHEMA)
+  columns={row[1] for row in self.conn.execute("PRAGMA table_info(worker_credentials)")}
+  if "single_use" not in columns:
+   self.conn.execute("ALTER TABLE worker_credentials ADD COLUMN single_use INTEGER NOT NULL DEFAULT 0 CHECK(single_use IN (0,1))")
+  if "consumed_at" not in columns:
+   self.conn.execute("ALTER TABLE worker_credentials ADD COLUMN consumed_at TEXT")
+  self.conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES('worker_control_plane_schema_v1',datetime('now'))")
+  self.conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES('worker_control_plane_bootstrap_lifecycle_v2',datetime('now'))")
+  self.conn.commit()
  @contextmanager
  def transaction(self):
   try:

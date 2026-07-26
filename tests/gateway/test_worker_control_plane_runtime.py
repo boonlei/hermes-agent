@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import inspect
+import json
 import os
+import sqlite3
 import stat
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -13,6 +16,7 @@ from aiohttp import ClientSession
 from aiohttp.test_utils import unused_port
 
 from gateway.worker_control_plane import runtime as pilot
+from gateway.worker_control_plane.auth import bootstrap_record
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
 from gateway.worker_control_plane.errors import WorkerControlPlaneError
 
@@ -35,7 +39,8 @@ class MutableClock:
 def test_pilot_provisioning_uses_owner_only_files_and_safe_storage(tmp_path):
     data_dir = tmp_path / "pilot"
     settings = pilot.pilot_test_settings(data_dir)
-    credential = pilot.provision_local_worker(settings)
+    credential = data_dir.resolve() / pilot.CREDENTIAL_FILE_NAME
+    report = pilot.provision_local_worker(settings, credential)
 
     assert settings.pilot_mode is True
     assert settings.test_mode is False
@@ -44,6 +49,7 @@ def test_pilot_provisioning_uses_owner_only_files_and_safe_storage(tmp_path):
     assert _mode(data_dir) == 0o700
     assert _mode(settings.db_path) == 0o600
     assert _mode(credential) == 0o600
+    assert report["single_use"] is True
 
     secret = credential.read_text(encoding="utf-8").strip()
     assert len(secret) >= 32
@@ -83,7 +89,8 @@ def test_runtime_cli_has_configurable_port_but_no_host_option():
 @pytest.mark.asyncio
 async def test_real_loopback_http_system_echo_lifecycle(tmp_path):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
-    credential = pilot.provision_local_worker(settings)
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    pilot.provision_local_worker(settings, credential)
     secret = credential.read_text(encoding="utf-8").strip()
     port = unused_port()
     runtime = pilot.LocalPilotRuntime(settings, port)
@@ -222,7 +229,7 @@ def _registered_service(tmp_path, **overrides):
     clock = MutableClock()
     settings = pilot.pilot_test_settings(tmp_path / "pilot", **overrides)
     service = pilot.WorkerControlPlaneService(settings, clock=clock)
-    secret = service.provision_worker()
+    secret = service.provision_worker()["secret"]
     instance_id = str(uuid.uuid4())
     _, registration = service.register_worker(
         {
@@ -457,20 +464,33 @@ def _active_bootstrap_hash(settings):
         service.close()
 
 
+def _bootstrap_hash_by_id(settings, credential_id):
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        return service.store.conn.execute(
+            "SELECT token_hash FROM worker_credentials WHERE credential_id=?",
+            (credential_id,),
+        ).fetchone()[0]
+    finally:
+        service.close()
+
+
 def test_unsafe_credential_destination_rejected_before_db_rotation(tmp_path):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
-    credential = pilot.provision_local_worker(settings)
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    pilot.provision_local_worker(settings, credential)
     original_hash = _active_bootstrap_hash(settings)
     credential.unlink()
     credential.mkdir()
     with pytest.raises(ValueError, match="credential destination"):
-        pilot.provision_local_worker(settings)
+        pilot.provision_local_worker(settings, credential)
     assert _active_bootstrap_hash(settings) == original_hash
 
 
 def test_credential_symlink_rejected_before_db_rotation(tmp_path):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
-    credential = pilot.provision_local_worker(settings)
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    pilot.provision_local_worker(settings, credential)
     original_hash = _active_bootstrap_hash(settings)
     outside = tmp_path / "outside-secret"
     outside.write_text("unchanged", encoding="utf-8")
@@ -480,7 +500,7 @@ def test_credential_symlink_rejected_before_db_rotation(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("symlinks are unavailable")
     with pytest.raises(ValueError, match="credential destination"):
-        pilot.provision_local_worker(settings)
+        pilot.provision_local_worker(settings, credential)
     assert outside.read_text(encoding="utf-8") == "unchanged"
     assert _active_bootstrap_hash(settings) == original_hash
 
@@ -490,8 +510,17 @@ def test_parent_replacement_is_rejected_without_secret_escape_or_db_rotation(
 ):
     root = tmp_path / "pilot"
     settings = pilot.pilot_test_settings(root)
-    pilot.provision_local_worker(settings)
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    first = pilot.provision_local_worker(settings, credential)
     original_hash = _active_bootstrap_hash(settings)
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        service.revoke_bootstrap_credential(
+            "server-a-worker", first["credential_id"]
+        )
+    finally:
+        service.close()
+    credential.unlink()
     moved = tmp_path / "pilot-original"
     outside = tmp_path / "outside"
     original_provision = pilot.WorkerControlPlaneService.provision_worker
@@ -506,10 +535,13 @@ def test_parent_replacement_is_rejected_without_secret_escape_or_db_rotation(
         pilot.WorkerControlPlaneService, "provision_worker", racing_provision
     )
     with pytest.raises(ValueError, match="pilot root changed"):
-        pilot.provision_local_worker(settings)
+        pilot.provision_local_worker(settings, credential)
     assert not (outside / pilot.CREDENTIAL_FILE_NAME).exists()
     moved_settings = pilot.pilot_test_settings(moved)
-    assert _active_bootstrap_hash(moved_settings) == original_hash
+    assert (
+        _bootstrap_hash_by_id(moved_settings, first["credential_id"])
+        == original_hash
+    )
 
 
 @pytest.mark.asyncio
@@ -595,3 +627,455 @@ async def test_startup_failure_closes_service_when_runner_cleanup_fails(
         await runtime.start()
     assert closed == [True]
     assert runtime.running is False
+
+
+def _registration_body(instance_id: str) -> dict:
+    return {
+        "protocol_version": "1.0",
+        "worker_id": "server-a-worker",
+        "instance_id": instance_id,
+        "worker_name": "commissioning security test",
+        "worker_version": "0.1.0",
+        "capabilities": ["system.echo"],
+    }
+
+
+@pytest.mark.parametrize("advance_seconds", (900, 901))
+def test_bootstrap_expired_at_or_after_boundary_is_rejected(
+    tmp_path, advance_seconds
+):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    try:
+        provisioned = service.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+        clock.advance(advance_seconds)
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(str(uuid.uuid4())),
+                provisioned["secret"],
+            )
+        assert exc.value.code == "invalid_credential"
+        row = service.store.conn.execute(
+            "SELECT consumed_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()
+        assert row["consumed_at"] is None
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_instances"
+        ).fetchone()[0] == 0
+    finally:
+        service.close()
+
+
+def test_valid_bootstrap_is_consumed_once_after_successful_register(tmp_path):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    instance_id = str(uuid.uuid4())
+    try:
+        provisioned = service.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+        status, _ = service.register_worker(
+            _registration_body(instance_id), provisioned["secret"]
+        )
+        assert status == 201
+        row = service.store.conn.execute(
+            "SELECT expires_at,single_use,consumed_at,revoked_at "
+            "FROM worker_credentials WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()
+        issued = datetime.fromisoformat(
+            provisioned["issued_at"].replace("Z", "+00:00")
+        )
+        expires = datetime.fromisoformat(
+            row["expires_at"].replace("Z", "+00:00")
+        )
+        assert expires - issued == timedelta(minutes=15)
+        assert row["single_use"] == 1
+        assert row["consumed_at"] is not None
+        assert row["revoked_at"] == row["consumed_at"]
+
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(instance_id), provisioned["secret"]
+            )
+        assert exc.value.code == "invalid_credential"
+    finally:
+        service.close()
+
+
+def test_failed_register_does_not_consume_single_use_bootstrap(tmp_path):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    first_instance = str(uuid.uuid4())
+    try:
+        first = service.provision_worker(ttl_seconds=900, single_use=True)
+        assert service.register_worker(
+            _registration_body(first_instance), first["secret"]
+        )[0] == 201
+
+        second = service.provision_worker(ttl_seconds=900, single_use=True)
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(str(uuid.uuid4())), second["secret"]
+            )
+        assert exc.value.code == "duplicate_active_instance"
+        row = service.store.conn.execute(
+            "SELECT consumed_at,revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (second["credential_id"],),
+        ).fetchone()
+        assert row["consumed_at"] is None
+        assert row["revoked_at"] is None
+
+        assert service.register_worker(
+            _registration_body(first_instance), second["secret"]
+        )[0] == 200
+    finally:
+        service.close()
+
+
+def test_concurrent_single_use_register_allows_exactly_one_success(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    setup = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    try:
+        provisioned = setup.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+    finally:
+        setup.close()
+
+    services = [
+        pilot.WorkerControlPlaneService(settings, clock=MutableClock())
+        for _ in range(2)
+    ]
+
+    def attempt(index):
+        try:
+            return services[index].register_worker(
+                _registration_body(str(uuid.uuid4())),
+                provisioned["secret"],
+            )[0]
+        except WorkerControlPlaneError as exc:
+            return exc.code
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(attempt, range(2)))
+        assert sorted(map(str, results)) == ["201", "invalid_credential"]
+        assert services[0].store.conn.execute(
+            "SELECT count(*) FROM worker_instances"
+        ).fetchone()[0] == 1
+    finally:
+        for service in services:
+            service.close()
+
+
+def test_revoked_bootstrap_is_rejected_and_metadata_is_redacted(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    try:
+        provisioned = service.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+        metadata = service.list_bootstrap_credentials("server-a-worker")
+        rendered = json.dumps(metadata)
+        assert provisioned["secret"] not in rendered
+        assert "token_hash" not in rendered
+        assert "salt" not in rendered
+        assert metadata[0]["credential_id"] == provisioned["credential_id"]
+
+        with pytest.raises(ValueError, match="credential target"):
+            service.revoke_bootstrap_credential(
+                "server-a-worker", str(uuid.uuid4())
+            )
+        assert service.store.conn.execute(
+            "SELECT revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()["revoked_at"] is None
+
+        revoked = service.revoke_bootstrap_credential(
+            "server-a-worker", provisioned["credential_id"]
+        )
+        assert revoked["state"] == "revoked"
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(str(uuid.uuid4())),
+                provisioned["secret"],
+            )
+        assert exc.value.code == "invalid_credential"
+        assert "bootstrap_credential_revoked" in service.audit_text()
+    finally:
+        service.close()
+
+
+def test_registration_inspection_and_exact_selected_revocation(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    instance_id = str(uuid.uuid4())
+    try:
+        provisioned = service.provision_worker(
+            ttl_seconds=900, single_use=True
+        )
+        _, response = service.register_worker(
+            _registration_body(instance_id), provisioned["secret"]
+        )
+        registrations = service.list_registrations("server-a-worker")
+        rendered = json.dumps(registrations)
+        assert response["access_token"] not in rendered
+        assert "token_hash" not in rendered
+        assert registrations[0]["registration_id"] == response["registration_id"]
+
+        with pytest.raises(ValueError, match="registration target"):
+            service.revoke_registration(
+                "server-a-worker",
+                str(uuid.uuid4()),
+                response["registration_id"],
+            )
+        assert service.store.conn.execute(
+            "SELECT status FROM worker_instances WHERE registration_id=?",
+            (response["registration_id"],),
+        ).fetchone()["status"] == "active"
+
+        revoked = service.revoke_registration(
+            "server-a-worker", instance_id, response["registration_id"]
+        )
+        assert revoked["status"] == "revoked"
+        assert "registration_revoked" in service.audit_text()
+    finally:
+        service.close()
+
+
+def test_provisioning_writes_exact_secret_only_artifact_and_safe_report(
+    tmp_path
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    destination = settings.approved_test_root / "commissioning.secret"
+    report = pilot.provision_local_worker(
+        settings, destination, ttl_seconds=900
+    )
+    raw = destination.read_bytes()
+    secret = raw.decode("utf-8")
+    assert raw == secret.encode("utf-8")
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert not raw.endswith(b"\n")
+    assert _mode(destination) == 0o600
+    assert report["single_use"] is True
+    assert set(report) == {
+        "credential_id",
+        "expires_at",
+        "single_use",
+        "transfer_file_sha256",
+    }
+    assert report["transfer_file_sha256"] == pilot.hashlib.sha256(raw).hexdigest()
+    assert secret not in json.dumps(report)
+
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        row = service.store.conn.execute(
+            "SELECT token_hash,salt,issued_at,expires_at,single_use "
+            "FROM worker_credentials WHERE credential_id=?",
+            (report["credential_id"],),
+        ).fetchone()
+        issued = datetime.fromisoformat(row["issued_at"].replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+        assert expires - issued == timedelta(minutes=15)
+        assert row["single_use"] == 1
+        assert secret not in {row["token_hash"], row["salt"]}
+        assert secret not in service.audit_text()
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("ttl", (True, 0, 901))
+def test_bootstrap_ttl_is_bounded_before_file_or_db_creation(tmp_path, ttl):
+    settings = pilot.pilot_test_settings(tmp_path / f"pilot-{ttl}")
+    destination = settings.approved_test_root / "commissioning.secret"
+    with pytest.raises(ValueError, match="TTL"):
+        pilot.provision_local_worker(settings, destination, ttl_seconds=ttl)
+    assert not destination.exists()
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_credentials WHERE kind='bootstrap'"
+        ).fetchone()[0] == 0
+    finally:
+        service.close()
+
+
+def test_legacy_schema_is_migrated_and_null_expiry_is_rejected(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    connection = sqlite3.connect(settings.db_path)
+    connection.execute(
+        "CREATE TABLE worker_credentials("
+        "credential_id TEXT PRIMARY KEY,worker_id TEXT NOT NULL,"
+        "kind TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,salt TEXT,"
+        "issued_at TEXT NOT NULL,expires_at TEXT,revoked_at TEXT)"
+    )
+    connection.commit()
+    connection.close()
+    settings.db_path.chmod(0o600)
+
+    service = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    try:
+        columns = {
+            row[1]
+            for row in service.store.conn.execute(
+                "PRAGMA table_info(worker_credentials)"
+            )
+        }
+        assert {"single_use", "consumed_at"} <= columns
+        service.store.conn.execute(
+            "INSERT INTO workers VALUES(?,?,?,1,NULL)",
+            ("server-a-worker", "legacy", '["system.echo"]'),
+        )
+        salt, digest = bootstrap_record("legacy-secret")
+        service.store.conn.execute(
+            "INSERT INTO worker_credentials("
+            "credential_id,worker_id,kind,token_hash,salt,issued_at,"
+            "expires_at,revoked_at,single_use,consumed_at"
+            ") VALUES(?,?,?,?,?,?,NULL,NULL,0,NULL)",
+            (
+                str(uuid.uuid4()),
+                "server-a-worker",
+                "bootstrap",
+                digest,
+                salt,
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        service.store.conn.commit()
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(
+                _registration_body(str(uuid.uuid4())), "legacy-secret"
+            )
+        assert exc.value.code == "invalid_credential"
+    finally:
+        service.close()
+
+
+def test_provisioning_refuses_unrevoked_credential_without_rotation(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    try:
+        first = service.provision_worker(ttl_seconds=900, single_use=True)
+        with pytest.raises(ValueError, match="unrevoked bootstrap"):
+            service.provision_worker(ttl_seconds=900, single_use=True)
+        rows = service.list_bootstrap_credentials("server-a-worker")
+        assert len(rows) == 1
+        assert rows[0]["credential_id"] == first["credential_id"]
+        assert rows[0]["state"] == "active"
+    finally:
+        service.close()
+
+
+def test_provisioning_output_is_explicit_and_confined(tmp_path):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    outside = tmp_path / "outside.secret"
+    with pytest.raises(ValueError, match="direct pilot-root"):
+        pilot.provision_local_worker(settings, outside)
+    assert not outside.exists()
+    with pytest.raises(ValueError, match="destination already exists"):
+        destination = settings.approved_test_root / "existing.secret"
+        destination.write_text("do-not-overwrite", encoding="utf-8")
+        destination.chmod(0o600)
+        pilot.provision_local_worker(settings, destination)
+    assert destination.read_text(encoding="utf-8") == "do-not-overwrite"
+
+
+def test_commissioning_admin_cli_requires_exact_safe_arguments(tmp_path):
+    parser = pilot.build_parser()
+    output = tmp_path / "commissioning.secret"
+    provision = parser.parse_args(
+        [
+            "provision",
+            "--output",
+            str(output),
+            "--ttl-seconds",
+            "900",
+        ]
+    )
+    assert provision.output == output
+    assert provision.ttl_seconds == 900
+    with pytest.raises(SystemExit):
+        parser.parse_args(["provision", "--ttl-seconds", "900"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["provision", "--output", str(output), "--ttl-seconds", "901"]
+        )
+
+    credential_id = str(uuid.uuid4())
+    credential = parser.parse_args(
+        [
+            "bootstrap",
+            "revoke",
+            "--worker-id",
+            "server-a-worker",
+            "--credential-id",
+            credential_id,
+        ]
+    )
+    assert credential.credential_id == credential_id
+
+    instance_id = str(uuid.uuid4())
+    registration_id = str(uuid.uuid4())
+    registration = parser.parse_args(
+        [
+            "registration",
+            "revoke",
+            "--worker-id",
+            "server-a-worker",
+            "--instance-id",
+            instance_id,
+            "--registration-id",
+            registration_id,
+        ]
+    )
+    assert registration.instance_id == instance_id
+    assert registration.registration_id == registration_id
+
+
+def test_provision_cli_prints_only_safe_metadata(monkeypatch, tmp_path, capsys):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    destination = settings.approved_test_root / "commissioning.secret"
+    monkeypatch.setattr(pilot, "pilot_settings", lambda: settings)
+
+    assert pilot.main(
+        [
+            "provision",
+            "--output",
+            str(destination),
+            "--ttl-seconds",
+            "900",
+        ]
+    ) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    secret = destination.read_text(encoding="utf-8")
+    assert set(report) == {
+        "credential_id",
+        "expires_at",
+        "single_use",
+        "transfer_file_sha256",
+    }
+    assert secret not in json.dumps(report)
+    assert report["transfer_file_sha256"] == pilot.hashlib.sha256(
+        destination.read_bytes()
+    ).hexdigest()

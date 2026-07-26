@@ -120,7 +120,7 @@ async def test_full_echo_lifecycle_and_idempotent_result(control_plane):
 
 @pytest.mark.asyncio
 async def test_registration_auth_capability_and_instance_guards(control_plane):
-    _, client, secret = control_plane
+    service, client, secret = control_plane
     bad = MockWorkerClient(client, "not-the-secret")
     assert (await bad.register())[0] == 401
     unknown = MockWorkerClient(client, secret, worker_id="unknown-worker")
@@ -129,8 +129,11 @@ async def test_registration_auth_capability_and_instance_guards(control_plane):
     assert (await worker.register(capabilities=["codex.task"]))[0] == 422
     assert (await worker.register(protocol_version="2.0"))[0] == 422
     assert (await worker.register())[0] == 201
+    worker.bootstrap_secret = service.provision_worker()["secret"]
     assert (await worker.register())[0] == 200
-    second = MockWorkerClient(client, secret)
+    second = MockWorkerClient(
+        client, service.provision_worker()["secret"]
+    )
     assert (await second.register())[0] == 409
 
 

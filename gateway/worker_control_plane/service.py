@@ -12,10 +12,23 @@ from .storage import WorkerControlPlaneStore
 _NO_REPLAY = object()
 
 class WorkerAuthService:
- def __init__(self, store, now): self.store,self.now=store,now
- def bootstrap(self, worker_id, secret):
-  row=self.store.conn.execute("SELECT c.*,w.enabled FROM worker_credentials c JOIN workers w USING(worker_id) WHERE c.worker_id=? AND c.kind='bootstrap' AND c.revoked_at IS NULL",(worker_id,)).fetchone()
-  if not row or not row['enabled'] or not verify_bootstrap(secret,row['salt'],row['token_hash']): raise error('invalid_credential')
+ def __init__(self, store, now, now_datetime): self.store,self.now,self.now_datetime=store,now,now_datetime
+ def bootstrap(self, c, worker_id, secret):
+  rows=c.execute("SELECT c.*,w.enabled FROM worker_credentials c JOIN workers w USING(worker_id) WHERE c.worker_id=? AND c.kind='bootstrap'",(worker_id,)).fetchall()
+  def matches(candidate):
+   try:
+    return verify_bootstrap(secret,candidate['salt'],candidate['token_hash'])
+   except (TypeError, ValueError):
+    return False
+  row=next((candidate for candidate in rows if matches(candidate)),None)
+  if not row or not row['enabled'] or row['revoked_at'] or row['consumed_at']: raise error('invalid_credential')
+  expires_at=row['expires_at']
+  if not isinstance(expires_at,str): raise error('invalid_credential')
+  try:
+   expiry=datetime.fromisoformat(expires_at.replace('Z','+00:00'))
+  except ValueError:
+   raise error('invalid_credential') from None
+  if expiry.tzinfo is None or expiry.astimezone(timezone.utc)<=self.now_datetime(): raise error('invalid_credential')
   return row
  def access(self, token):
   rows=self.store.conn.execute("SELECT c.worker_id,c.credential_id,c.token_hash,c.expires_at,c.revoked_at,w.enabled,i.instance_id,i.registration_id,i.status FROM worker_credentials c JOIN workers w USING(worker_id) JOIN worker_instances i ON i.access_credential_id=c.credential_id WHERE c.kind='access'").fetchall()
@@ -29,7 +42,7 @@ class WorkerAuthService:
 class WorkerControlPlaneService:
  def __init__(self, settings, *, clock: Callable[[], datetime] | None = None):
   if not settings.enabled or settings.test_mode == settings.pilot_mode: raise ValueError('isolated mode required')
-  self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._clock=clock or (lambda: datetime.now(timezone.utc)); self.auth=WorkerAuthService(self.store,self.now)
+  self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._clock=clock or (lambda: datetime.now(timezone.utc)); self.auth=WorkerAuthService(self.store,self.now,self._now_datetime)
  def _now_datetime(self):
   value=self._clock()
   if not isinstance(value,datetime) or value.tzinfo is None: raise RuntimeError('clock must return timezone-aware datetime')
@@ -45,24 +58,65 @@ class WorkerControlPlaneService:
   c.execute("INSERT INTO worker_audit_log(occurred_at,event_type,worker_id,instance_id,registration_id,task_id,delivery_id,trace_id,outcome,reason_code) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.now(),event,safe.get('worker_id'),safe.get('instance_id'),safe.get('registration_id'),safe.get('task_id'),safe.get('delivery_id'),safe.get('trace_id'),safe.get('outcome','ok'),safe.get('reason_code')))
  def record_rejection(self,event,**fields):
   with self.store.transaction() as c: self._audit(c,event,outcome='rejected',**fields)
- def provision_worker(self, *, secret=None, install_credential=None):
+ def provision_worker(self, *, secret=None, ttl_seconds=900, single_use=True, install_credential=None):
   if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
-  secret=secret or secrets.token_urlsafe(32); salt,digest=bootstrap_record(secret)
+  if type(ttl_seconds) is not int or not 1<=ttl_seconds<=900: raise ValueError('bootstrap TTL must be between 1 and 900 seconds')
+  if type(single_use) is not bool: raise ValueError('single_use must be boolean')
+  secret=secret or secrets.token_urlsafe(32); salt,digest=bootstrap_record(secret); credential_id=str(uuid.uuid4())
+  issued_datetime=self._now_datetime(); issued_at=issued_datetime.isoformat().replace('+00:00','Z'); expires_at=(issued_datetime+timedelta(seconds=ttl_seconds)).isoformat().replace('+00:00','Z')
   rollback_file=None; finalize_file=None
   try:
    with self.store.transaction() as c:
     c.execute("INSERT INTO workers(worker_id,worker_name,allowed_capabilities,enabled,revoked_at) VALUES(?,?,?,1,NULL) ON CONFLICT(worker_id) DO UPDATE SET worker_name=excluded.worker_name,allowed_capabilities=excluded.allowed_capabilities,enabled=1,revoked_at=NULL",('server-a-worker','Hermes local pilot worker','[\"system.echo\"]'))
-    c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",(self.now(),'server-a-worker'))
-    c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),'server-a-worker','bootstrap',digest,salt,self.now(),None,None)); self._audit(c,'worker_provisioned',worker_id='server-a-worker')
+    if c.execute("SELECT 1 FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",('server-a-worker',)).fetchone():
+     raise ValueError('an unrevoked bootstrap credential already exists')
+    c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at) VALUES(?,?,?,?,?,?,?,?,?,NULL)",(credential_id,'server-a-worker','bootstrap',digest,salt,issued_at,expires_at,None,int(single_use))); self._audit(c,'worker_provisioned',worker_id='server-a-worker',reason_code=credential_id)
     if install_credential is not None: rollback_file,finalize_file=install_credential()
   except Exception:
    if rollback_file is not None: rollback_file()
    raise
   if finalize_file is not None: finalize_file()
-  return secret
+  return {'secret':secret,'credential_id':credential_id,'issued_at':issued_at,'expires_at':expires_at,'single_use':single_use}
  def seed_test_worker(self):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
-  return self.provision_worker()
+  return self.provision_worker()['secret']
+ def list_bootstrap_credentials(self,worker_id):
+  rows=self.store.conn.execute("SELECT credential_id,worker_id,issued_at,expires_at,revoked_at,single_use,consumed_at FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' ORDER BY issued_at,credential_id",(worker_id,)).fetchall()
+  result=[]
+  for row in rows:
+   if row['consumed_at'] is not None: state='consumed'
+   elif row['revoked_at'] is not None: state='revoked'
+   elif row['expires_at'] is None: state='invalid'
+   else:
+    try:
+     expiry=datetime.fromisoformat(row['expires_at'].replace('Z','+00:00'))
+     state='expired' if expiry.tzinfo is None or expiry.astimezone(timezone.utc)<=self._now_datetime() else 'active'
+    except ValueError:
+     state='invalid'
+   result.append({'credential_id':row['credential_id'],'worker_id':row['worker_id'],'issued_at':row['issued_at'],'expires_at':row['expires_at'],'single_use':bool(row['single_use']),'consumed_at':row['consumed_at'],'revoked_at':row['revoked_at'],'state':state})
+  return result
+ def revoke_bootstrap_credential(self,worker_id,credential_id):
+  with self.store.transaction() as c:
+   row=c.execute("SELECT credential_id FROM worker_credentials WHERE worker_id=? AND credential_id=? AND kind='bootstrap' AND revoked_at IS NULL",(worker_id,credential_id)).fetchone()
+   if not row: raise ValueError('credential target not found or already revoked')
+   revoked_at=self.now()
+   changed=c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND credential_id=? AND kind='bootstrap' AND revoked_at IS NULL",(revoked_at,worker_id,credential_id)).rowcount
+   if changed!=1: raise ValueError('credential target changed during revocation')
+   self._audit(c,'bootstrap_credential_revoked',worker_id=worker_id,reason_code=credential_id)
+  return {'credential_id':credential_id,'worker_id':worker_id,'revoked_at':revoked_at,'state':'revoked'}
+ def list_registrations(self,worker_id):
+  rows=self.store.conn.execute("SELECT i.worker_id,i.instance_id,i.registration_id,i.status,i.worker_version,i.protocol_version,i.registered_at,i.last_seen_at,i.current_task_id,w.enabled,w.revoked_at AS worker_revoked_at FROM worker_instances i JOIN workers w USING(worker_id) WHERE i.worker_id=? ORDER BY i.registered_at,i.registration_id",(worker_id,)).fetchall()
+  return [{'worker_id':row['worker_id'],'instance_id':row['instance_id'],'registration_id':row['registration_id'],'status':row['status'],'worker_version':row['worker_version'],'protocol_version':row['protocol_version'],'registered_at':row['registered_at'],'last_seen_at':row['last_seen_at'],'current_task_id':row['current_task_id'],'worker_enabled':bool(row['enabled']),'worker_revoked_at':row['worker_revoked_at']} for row in rows]
+ def revoke_registration(self,worker_id,instance_id,registration_id):
+  with self.store.transaction() as c:
+   row=c.execute("SELECT registration_id,access_credential_id FROM worker_instances WHERE worker_id=? AND instance_id=? AND registration_id=? AND status='active'",(worker_id,instance_id,registration_id)).fetchone()
+   if not row: raise ValueError('registration target not found or not active')
+   revoked_at=self.now()
+   changed=c.execute("UPDATE worker_instances SET status='revoked' WHERE worker_id=? AND instance_id=? AND registration_id=? AND status='active'",(worker_id,instance_id,registration_id)).rowcount
+   if changed!=1: raise ValueError('registration target changed during revocation')
+   c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=? AND revoked_at IS NULL",(revoked_at,row['access_credential_id']))
+   self._audit(c,'registration_revoked',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id)
+  return {'worker_id':worker_id,'instance_id':instance_id,'registration_id':registration_id,'status':'revoked','revoked_at':revoked_at}
  def revoke_test_worker(self):
   with self.store.transaction() as c:
    c.execute("UPDATE workers SET enabled=0,revoked_at=? WHERE worker_id='server-a-worker'",(self.now(),)); self._audit(c,'worker_revoked',worker_id='server-a-worker')
@@ -83,10 +137,11 @@ class WorkerControlPlaneService:
  def register_worker(self,d,secret):
   if d.get('protocol_version')!='1.0': raise error('unsupported_protocol')
   if d.get('worker_id')!='server-a-worker' or d.get('capabilities') != ['system.echo']: raise error('unsupported_capability' if d.get('worker_id')=='server-a-worker' else 'invalid_credential')
-  row=self.auth.bootstrap(d['worker_id'],secret); iid=d.get('instance_id')
+  iid=d.get('instance_id')
   try: uuid.UUID(iid)
   except Exception: raise error('malformed_request')
   with self.store.transaction() as c:
+   bootstrap=self.auth.bootstrap(c,d['worker_id'],secret)
    active=c.execute("SELECT * FROM worker_instances WHERE worker_id=? AND status='active'",(d['worker_id'],)).fetchone()
    if active and active['instance_id'] != iid: self._audit(c,'registration_rejected',worker_id=d['worker_id'],outcome='rejected',reason_code='duplicate_active_instance'); raise error('duplicate_active_instance')
    token,thash=new_access_token(); cid=str(uuid.uuid4()); expiry=(self._now_datetime()+timedelta(seconds=self.settings.token_ttl_seconds)).isoformat().replace('+00:00','Z')
@@ -94,9 +149,14 @@ class WorkerControlPlaneService:
     c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=?",(self.now(),active['access_credential_id'])); rid=active['registration_id']; status=200; event='worker_reregistered'
    else:
     rid=str(uuid.uuid4()); status=201; event='worker_registered'
-   c.execute("INSERT INTO worker_credentials VALUES(?,?,?,?,?,?,?,?)",(cid,d['worker_id'],'access',thash,None,self.now(),expiry,None))
+   c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at) VALUES(?,?,?,?,?,?,?,?,0,NULL)",(cid,d['worker_id'],'access',thash,None,self.now(),expiry,None))
    if active: c.execute("UPDATE worker_instances SET access_credential_id=?,last_seen_at=? WHERE registration_id=?",(cid,self.now(),rid))
    else: c.execute("INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,d['worker_id'],iid,'active',d.get('worker_version','0'),d['protocol_version'],self.now(),self.now(),cid,None))
+   if bootstrap['single_use']:
+    consumed_at=self.now()
+    changed=c.execute("UPDATE worker_credentials SET consumed_at=?,revoked_at=? WHERE credential_id=? AND consumed_at IS NULL AND revoked_at IS NULL",(consumed_at,consumed_at,bootstrap['credential_id'])).rowcount
+    if changed!=1: raise error('invalid_credential')
+    self._audit(c,'bootstrap_credential_consumed',worker_id=d['worker_id'],registration_id=rid,reason_code=bootstrap['credential_id'])
    self._audit(c,event,worker_id=d['worker_id'],instance_id=iid,registration_id=rid)
   return status,{'registration_id':rid,'worker_id':d['worker_id'],'accepted_capabilities':['system.echo'],'access_token':token,'access_token_expires_at':expiry,'heartbeat_interval_seconds':self.settings.heartbeat_seconds,'ack_deadline_seconds':self.settings.ack_deadline_seconds,'lease_seconds':self.settings.lease_seconds,'server_time':self.now()}
  def _context(self,token,d):
