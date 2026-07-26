@@ -93,6 +93,22 @@ def _result(body: dict, route_task_id: str) -> None:
 def _failure(exc: WorkerControlPlaneError) -> web.Response:
     return web.json_response({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable, "trace_id": str(uuid.uuid4())}}, status=exc.status)
 
+def _http_failure(exc: web.HTTPException) -> web.Response:
+    if isinstance(exc, web.HTTPNotFound):
+        code, message = "not_found", "Not found"
+    elif isinstance(exc, web.HTTPMethodNotAllowed):
+        code, message = "method_not_allowed", "Method not allowed"
+    else:
+        code, message = "http_error", "HTTP request failed"
+    headers = {}
+    if isinstance(exc, web.HTTPMethodNotAllowed):
+        headers["Allow"] = exc.headers["Allow"]
+    return web.json_response(
+        {"error": {"code": code, "message": message, "retryable": False, "trace_id": str(uuid.uuid4())}},
+        status=exc.status,
+        headers=headers,
+    )
+
 def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, service: WorkerControlPlaneService | None = None) -> web.Application:
     if not settings.enabled or settings.test_mode == settings.pilot_mode:
         raise ValueError("Worker Control Plane requires one isolated mode")
@@ -108,6 +124,8 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
             return _failure(exc)
         except web.HTTPRequestEntityTooLarge:
             return _failure(error("payload_too_large"))
+        except web.HTTPException as exc:
+            return _http_failure(exc)
         except (TypeError, ValueError, KeyError):
             return _failure(error("malformed_request"))
         except Exception:
@@ -133,6 +151,10 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
             return wrapped
         return decorate
 
+    async def health(request: web.Request):
+        svc.check_health()
+        return web.json_response({"status": "ok"})
+
     @audited("registration_rejected")
     async def register(request: web.Request):
         body = await _json(request, REGISTER); _register(body)
@@ -155,6 +177,7 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
     async def result(request: web.Request):
         body = await _json(request, RESULT); _result(body, request.match_info["task_id"])
         return web.json_response(svc.submit_result(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
+    app.router.add_get("/health", health)
     app.router.add_post("/worker/v1/register", register)
     app.router.add_post("/worker/v1/heartbeat", heartbeat)
     app.router.add_post("/worker/v1/tasks/poll", poll)

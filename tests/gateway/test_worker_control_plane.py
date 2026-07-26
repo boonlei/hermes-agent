@@ -47,6 +47,100 @@ async def control_plane(tmp_path):
         service.close()
 
 
+@pytest.mark.asyncio
+async def test_health_is_public_safe_and_read_only(control_plane):
+    service, client, _ = control_plane
+    changes_before = service.store.conn.total_changes
+    audit_before = service.store.conn.execute(
+        "SELECT count(*) FROM worker_audit_log"
+    ).fetchone()[0]
+
+    response = await client.get("/health")
+
+    assert response.status == 200
+    assert response.content_type == "application/json"
+    assert await response.json() == {"status": "ok"}
+    assert service.store.conn.total_changes == changes_before
+    assert service.store.conn.execute(
+        "SELECT count(*) FROM worker_audit_log"
+    ).fetchone()[0] == audit_before
+
+
+@pytest.mark.asyncio
+async def test_http_routing_errors_preserve_status_and_safe_json(control_plane):
+    _, client, _ = control_plane
+
+    response = await client.post("/health")
+    assert response.status == 405
+    assert (await response.json())["error"]["code"] == "method_not_allowed"
+
+    response = await client.get("/missing")
+    assert response.status == 404
+    assert (await response.json())["error"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    (
+        "/worker/v1/register",
+        "/worker/v1/heartbeat",
+        "/worker/v1/tasks/poll",
+        f"/worker/v1/tasks/{uuid.uuid4()}/ack",
+        f"/worker/v1/tasks/{uuid.uuid4()}/result",
+    ),
+)
+async def test_worker_protocol_routes_remain_post_only(control_plane, path):
+    _, client, _ = control_plane
+
+    response = await client.get(path)
+
+    assert response.status == 405
+    assert (await response.json())["error"]["code"] == "method_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_real_internal_exception_is_redacted_and_returns_503(tmp_path):
+    settings = WorkerControlPlaneSettings.for_test(
+        tmp_path / "worker-control-plane.db", approved_test_root=tmp_path
+    )
+    service = WorkerControlPlaneService(settings, clock=MutableTestClock())
+    app = create_worker_control_plane_app(settings, service)
+
+    async def fail(_request):
+        raise RuntimeError("sensitive internal detail")
+
+    app.router.add_get("/fail", fail)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/fail")
+        body = await response.json()
+        assert response.status == 503
+        assert body["error"]["code"] == "internal_error"
+        assert body["error"]["retryable"] is True
+        assert "sensitive internal detail" not in str(body)
+    finally:
+        await client.close()
+        service.close()
+
+
+@pytest.mark.asyncio
+async def test_health_storage_failure_fails_closed(control_plane, monkeypatch):
+    service, client, _ = control_plane
+
+    def fail():
+        raise RuntimeError("sensitive database detail")
+
+    monkeypatch.setattr(service.store, "check_health", fail)
+    response = await client.get("/health")
+    body = await response.json()
+    assert response.status == 503
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["retryable"] is True
+    assert "sensitive database detail" not in str(body)
+
+
 def _register_direct_test_worker(service):
     secret = service.seed_test_worker()
     instance_id = str(uuid.uuid4())

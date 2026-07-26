@@ -60,4 +60,7 @@ class WorkerControlPlaneStore:
   try:
    self.conn.execute("BEGIN IMMEDIATE"); yield self.conn; self.conn.commit()
   except Exception: self.conn.rollback(); raise
+ def check_health(self):
+  row=self.conn.execute("SELECT 1").fetchone()
+  if row is None or row[0] != 1: raise RuntimeError("storage health check failed")
  def close(self): self.conn.close()
