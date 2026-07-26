@@ -177,7 +177,11 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
     async def result(request: web.Request):
         body = await _json(request, RESULT); _result(body, request.match_info["task_id"])
         return web.json_response(svc.submit_result(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
-    app.router.add_get("/health", health)
+    app.router.add_get(
+        "/health",
+        health,
+        allow_head=False,
+    )
     app.router.add_post("/worker/v1/register", register)
     app.router.add_post("/worker/v1/heartbeat", heartbeat)
     app.router.add_post("/worker/v1/tasks/poll", poll)

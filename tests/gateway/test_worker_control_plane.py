@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.worker_control_plane.app import create_worker_control_plane_app
+from gateway.worker_control_plane.app import (
+    _http_failure,
+    create_worker_control_plane_app,
+)
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
 from gateway.worker_control_plane.service import WorkerControlPlaneService
 from tests.gateway.worker_control_plane_helpers import MockWorkerClient
@@ -64,6 +69,43 @@ async def test_health_is_public_safe_and_read_only(control_plane):
     assert service.store.conn.execute(
         "SELECT count(*) FROM worker_audit_log"
     ).fetchone()[0] == audit_before
+
+
+@pytest.mark.asyncio
+async def test_health_rejects_head_without_mutation(control_plane):
+    service, client, _ = control_plane
+    changes_before = service.store.conn.total_changes
+    audit_before = service.store.conn.execute(
+        "SELECT count(*) FROM worker_audit_log"
+    ).fetchone()[0]
+
+    response = await client.head("/health")
+
+    assert response.status == 405
+    assert response.content_type == "application/json"
+    assert response.headers["Allow"] == "GET"
+    assert service.store.conn.total_changes == changes_before
+    assert service.store.conn.execute(
+        "SELECT count(*) FROM worker_audit_log"
+    ).fetchone()[0] == audit_before
+
+
+def test_health_head_error_representation_is_safe_json():
+    response = _http_failure(web.HTTPMethodNotAllowed("HEAD", {"GET"}))
+
+    body = json.loads(response.body)
+    assert response.status == 405
+    assert response.content_type == "application/json"
+    assert response.headers["Allow"] == "GET"
+    assert set(body) == {"error"}
+    assert set(body["error"]) == {
+        "code",
+        "message",
+        "retryable",
+        "trace_id",
+    }
+    assert body["error"]["code"] == "method_not_allowed"
+    assert body["error"]["retryable"] is False
 
 
 @pytest.mark.asyncio
