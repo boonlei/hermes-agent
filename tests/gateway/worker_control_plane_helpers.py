@@ -13,6 +13,7 @@ class MockWorkerClient:
         self.instance_id = str(uuid.uuid4())
         self.registration_id = None
         self.access_token = None
+        self.capabilities = ["system.echo"]
 
     async def register(
         self,
@@ -21,17 +22,21 @@ class MockWorkerClient:
         protocol_version="1.0",
         worker_version="0.1.0",
     ):
+        requested_capabilities = (
+            ["system.echo"] if capabilities is None else capabilities
+        )
         response = await self.client.post(
             "/worker/v1/register",
             headers={"Authorization": f"Worker-Bootstrap {self.bootstrap_secret}"},
             json={"protocol_version": protocol_version, "worker_id": self.worker_id,
                   "instance_id": self.instance_id, "worker_name": "test worker",
-                  "worker_version": worker_version, "capabilities": capabilities or ["system.echo"]},
+                  "worker_version": worker_version, "capabilities": requested_capabilities},
         )
         body = await response.json()
         if response.status in (200, 201):
             self.registration_id = body["registration_id"]
             self.access_token = body["access_token"]
+            self.capabilities = requested_capabilities
         return response.status, body
 
     def headers(self, key=None):
@@ -50,8 +55,12 @@ class MockWorkerClient:
         response = await self.client.post("/worker/v1/heartbeat", headers=self.headers(), json=data)
         return response.status, await response.json()
 
-    async def poll(self, key="poll-1"):
-        data = self.base() | {"capabilities": ["system.echo"], "max_tasks": 1, "wait_seconds": 0}
+    async def poll(self, key="poll-1", *, capabilities=None):
+        data = self.base() | {
+            "capabilities": self.capabilities if capabilities is None else capabilities,
+            "max_tasks": 1,
+            "wait_seconds": 0,
+        }
         response = await self.client.post("/worker/v1/tasks/poll", headers=self.headers(key), json=data)
         return response.status, (await response.json() if response.status != 204 else None)
 
@@ -61,12 +70,35 @@ class MockWorkerClient:
         response = await self.client.post(f'/worker/v1/tasks/{task["task_id"]}/ack', headers=self.headers(key), json=data)
         return response.status, await response.json()
 
-    async def result(self, task, *, stdout=None, result_key="result-1", request_key="request-result-1"):
-        message = task["payload"]["message"] if stdout is None else stdout
+    async def result(
+        self,
+        task,
+        *,
+        stdout=None,
+        stderr="",
+        status="completed",
+        exit_code=0,
+        duration_ms=0,
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:00:00Z",
+        failure_code=None,
+        result_key="result-1",
+        request_key="request-result-1",
+    ):
+        default_stdout = (
+            task["payload"]["message"]
+            if task["task_type"] == "system.echo"
+            else "HERMES-CODEX-READ-ONLY-OK"
+        )
+        message = default_stdout if stdout is None else stdout
         data = self.base() | {"task_id": task["task_id"], "delivery_id": task["delivery_id"],
-            "task_type": "system.echo", "status": "completed", "stdout": message, "stderr": "",
-            "exit_code": 0, "started_at": "2026-01-01T00:00:00Z", "finished_at": "2026-01-01T00:00:00Z",
-            "duration_ms": 0, "result_idempotency_key": result_key, "payload_hash": task["payload_hash"],
+            "task_type": task["task_type"], "status": status, "stdout": message, "stderr": stderr,
+            "exit_code": exit_code, "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_ms": duration_ms, "result_idempotency_key": result_key,
+            "payload_hash": task["payload_hash"],
             "trace_id": task["trace_id"]}
+        if failure_code is not None:
+            data["failure_code"] = failure_code
         response = await self.client.post(f'/worker/v1/tasks/{task["task_id"]}/result', headers=self.headers(request_key), json=data)
         return response.status, await response.json()

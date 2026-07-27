@@ -6,7 +6,12 @@ from aiohttp import web
 
 from .config import WorkerControlPlaneSettings
 from .errors import WorkerControlPlaneError, error
-from .models import require_uuid, require_timestamp, require_worker_id
+from .models import (
+    validate_capabilities,
+    require_uuid,
+    require_timestamp,
+    require_worker_id,
+)
 from .service import WorkerControlPlaneService
 
 SERVICE_KEY: web.AppKey[WorkerControlPlaneService] = web.AppKey(
@@ -32,12 +37,23 @@ def _key(request: web.Request) -> str:
         raise error("malformed_request")
     return key
 
-async def _json(request: web.Request, fields: set[str]) -> dict:
+async def _json(
+    request: web.Request,
+    fields: set[str],
+    optional_fields: set[str] | None = None,
+) -> dict:
     try:
         body = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        raise
     except Exception:
         raise error("malformed_request") from None
-    if not isinstance(body, dict) or set(body) != fields:
+    optional_fields = optional_fields or set()
+    if (
+        not isinstance(body, dict)
+        or not fields <= set(body)
+        or set(body) - fields - optional_fields
+    ):
         raise error("malformed_request")
     return body
 
@@ -51,7 +67,9 @@ def _register(body: dict) -> None:
         raise error("unsupported_protocol")
     require_worker_id(body["worker_id"])
     require_uuid(body["instance_id"], "instance_id")
-    if body["capabilities"] != ["system.echo"]:
+    try:
+        validate_capabilities(body["capabilities"])
+    except ValueError:
         raise error("unsupported_capability")
 
 def _heartbeat(body: dict) -> None:
@@ -64,7 +82,9 @@ def _heartbeat(body: dict) -> None:
 
 def _poll(body: dict) -> None:
     _identity(body)
-    if body["capabilities"] != ["system.echo"]:
+    try:
+        validate_capabilities(body["capabilities"])
+    except ValueError:
         raise error("unsupported_capability")
     if type(body["max_tasks"]) is not int or type(body["wait_seconds"]) is not int:
         raise error("malformed_request")
@@ -80,7 +100,7 @@ def _ack(body: dict) -> None:
 
 def _result(body: dict, route_task_id: str) -> None:
     _identity(body); require_uuid(body["delivery_id"], "delivery_id"); require_uuid(body["task_id"], "task_id"); require_uuid(body["trace_id"], "trace_id")
-    if body["task_id"] != route_task_id or body["task_type"] != "system.echo" or body["status"] not in {"completed", "failed", "rejected", "cancelled", "expired"}:
+    if body["task_id"] != route_task_id or body["task_type"] not in {"system.echo", "codex.execute"} or body["status"] not in {"completed", "failed", "rejected", "cancelled", "expired"}:
         raise error("invalid_result")
     if not isinstance(body["stdout"], str) or not isinstance(body["stderr"], str) or type(body["exit_code"]) is not int or type(body["duration_ms"]) is not int or body["duration_ms"] < 0:
         raise error("invalid_result")
@@ -223,7 +243,7 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         return web.json_response(svc.ack_delivery(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
     @audited("result_rejected")
     async def result(request: web.Request):
-        body = await _json(request, RESULT); _result(body, request.match_info["task_id"])
+        body = await _json(request, RESULT, {"failure_code"}); _result(body, request.match_info["task_id"])
         return web.json_response(svc.submit_result(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
     app.router.add_get(
         "/health",

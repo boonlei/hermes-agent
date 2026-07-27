@@ -21,6 +21,17 @@ from aiohttp import web
 
 from .app import create_worker_control_plane_app
 from .config import PILOT_DATA_DIRECTORY, WorkerControlPlaneSettings
+from .models import (
+    CODEX_EXECUTE_BRANCH,
+    CODEX_EXECUTE_HOST,
+    CODEX_EXECUTE_MODE,
+    CODEX_EXECUTE_PATH_ID,
+    CODEX_EXECUTE_REPOSITORY,
+    CODEX_EXECUTE_WORKER_ID,
+    EXPECTED_HEAD_RE,
+    INSTRUCTION_TASK_ID_RE,
+    KNOWN_CAPABILITIES,
+)
 from .service import WorkerControlPlaneService
 
 
@@ -258,6 +269,7 @@ def provision_local_worker(
     output_path: Path,
     *,
     ttl_seconds: int = 900,
+    capabilities: list[str] | None = None,
 ) -> dict:
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 900:
         raise ValueError("bootstrap TTL must be between 1 and 900 seconds")
@@ -276,6 +288,7 @@ def provision_local_worker(
                 secret=secret,
                 ttl_seconds=ttl_seconds,
                 single_use=True,
+                capabilities=capabilities,
                 install_credential=lambda: _install_staged_secret(
                     root_fd, settings.approved_test_root, name, temporary
                 ),
@@ -294,6 +307,7 @@ def provision_local_worker(
         "credential_id": provisioned["credential_id"],
         "expires_at": provisioned["expires_at"],
         "single_use": provisioned["single_use"],
+        "capabilities": provisioned["capabilities"],
         "transfer_file_sha256": hashlib.sha256(secret_bytes).hexdigest(),
     }
 
@@ -348,6 +362,44 @@ def enqueue_local_echo(settings: WorkerControlPlaneSettings, message: str) -> st
     try:
         return service.enqueue_system_echo(
             {"message": message}, f"pilot-enqueue-{uuid.uuid4()}"
+        )
+    finally:
+        service.close()
+
+
+def enqueue_local_codex_execute(
+    settings: WorkerControlPlaneSettings,
+    *,
+    expected_head: str,
+    instruction_task_id: str,
+    instruction: str,
+    timeout_seconds: int,
+    max_result_bytes: int,
+    idempotency_key: str,
+) -> str:
+    payload = {
+        "task_type": "codex.execute",
+        "target": {
+            "host": CODEX_EXECUTE_HOST,
+            "repository": CODEX_EXECUTE_REPOSITORY,
+            "path_id": CODEX_EXECUTE_PATH_ID,
+            "branch": CODEX_EXECUTE_BRANCH,
+            "expected_head": expected_head,
+        },
+        "instruction": {
+            "task_id": instruction_task_id,
+            "text": instruction,
+            "mode": CODEX_EXECUTE_MODE,
+        },
+        "limits": {
+            "timeout_seconds": timeout_seconds,
+            "max_result_bytes": max_result_bytes,
+        },
+    }
+    service = WorkerControlPlaneService(settings)
+    try:
+        return service.enqueue_codex_execute(
+            payload, idempotency_key, CODEX_EXECUTE_WORKER_ID
         )
     finally:
         service.close()
@@ -502,6 +554,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provision.add_argument("--output", type=Path, required=True)
     provision.add_argument("--ttl-seconds", type=_bootstrap_ttl, default=900)
+    provision.add_argument(
+        "--capability",
+        action="append",
+        choices=KNOWN_CAPABILITIES,
+        dest="capabilities",
+    )
     bootstrap = commands.add_parser(
         "bootstrap", help="inspect or revoke one bootstrap credential"
     )
@@ -540,8 +598,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--registration-id", type=_uuid, required=True
     )
     enqueue = commands.add_parser("enqueue", help="enqueue one local pilot task")
-    enqueue.add_argument("task_type", choices=("system.echo",))
+    enqueue.add_argument("task_type", choices=KNOWN_CAPABILITIES)
     enqueue.add_argument("message")
+    enqueue.add_argument("--expected-head")
+    enqueue.add_argument("--instruction-task-id")
+    enqueue.add_argument("--idempotency-key")
+    enqueue.add_argument("--timeout-seconds", type=int, default=900)
+    enqueue.add_argument("--max-result-bytes", type=int, default=32768)
     return parser
 
 
@@ -554,7 +617,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = pilot_settings()
     if parsed.command == "provision":
         report = provision_local_worker(
-            settings, parsed.output, ttl_seconds=parsed.ttl_seconds
+            settings,
+            parsed.output,
+            ttl_seconds=parsed.ttl_seconds,
+            capabilities=parsed.capabilities,
         )
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0
@@ -580,7 +646,44 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0
     if parsed.command == "enqueue":
-        task_id = enqueue_local_echo(settings, parsed.message)
+        if parsed.task_type == "system.echo":
+            if any(
+                value is not None
+                for value in (
+                    parsed.expected_head,
+                    parsed.instruction_task_id,
+                    parsed.idempotency_key,
+                )
+            ):
+                build_parser().error(
+                    "codex.execute options are not valid for system.echo"
+                )
+            task_id = enqueue_local_echo(settings, parsed.message)
+        else:
+            if (
+                not isinstance(parsed.expected_head, str)
+                or not EXPECTED_HEAD_RE.fullmatch(parsed.expected_head)
+                or not isinstance(parsed.instruction_task_id, str)
+                or not INSTRUCTION_TASK_ID_RE.fullmatch(
+                    parsed.instruction_task_id
+                )
+                or not isinstance(parsed.idempotency_key, str)
+                or not parsed.idempotency_key
+                or len(parsed.idempotency_key) > 128
+            ):
+                build_parser().error(
+                    "codex.execute requires valid expected head, "
+                    "instruction task ID, and idempotency key"
+                )
+            task_id = enqueue_local_codex_execute(
+                settings,
+                expected_head=parsed.expected_head,
+                instruction_task_id=parsed.instruction_task_id,
+                instruction=parsed.message,
+                timeout_seconds=parsed.timeout_seconds,
+                max_result_bytes=parsed.max_result_bytes,
+                idempotency_key=parsed.idempotency_key,
+            )
         print(f"Enqueued {parsed.task_type} task {task_id}")
         return 0
     try:

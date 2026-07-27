@@ -10,6 +10,7 @@ import sqlite3
 import stat
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock
 
@@ -87,6 +88,235 @@ def test_runtime_cli_has_configurable_port_but_no_host_option():
     assert pilot._LOOPBACK_ADDRESS == "127.0.0.1"
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "--host", "0.0.0.0"])
+
+
+def test_codex_execute_admin_path_builds_only_fixed_structured_payload(
+    tmp_path
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    pilot.provision_local_worker(
+        settings, credential, capabilities=["codex.execute"]
+    )
+
+    task_id = pilot.enqueue_local_codex_execute(
+        settings,
+        expected_head="a" * 40,
+        instruction_task_id="m3a-admin-path",
+        instruction="Read only review.",
+        timeout_seconds=900,
+        max_result_bytes=32768,
+        idempotency_key="m3a-admin-idempotency",
+    )
+
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        row = service.store.conn.execute(
+            "SELECT task_type,payload_json,state,worker_id "
+            "FROM worker_tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        assert tuple(row) == (
+            "codex.execute",
+            row["payload_json"],
+            "queued",
+            "server-a-worker",
+        )
+        assert payload["target"] == {
+            "host": "DESKTOP-87SSHTU",
+            "repository": "boonlei/HermesServerWorker",
+            "path_id": "hermes-server-worker",
+            "branch": "main",
+            "expected_head": "a" * 40,
+        }
+        assert payload["instruction"]["mode"] == "read_only"
+        assert set(payload) == {"task_type", "target", "instruction", "limits"}
+    finally:
+        service.close()
+
+
+def test_concurrent_codex_execute_creation_allows_only_one_active_task(
+    tmp_path
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
+    pilot.provision_local_worker(
+        settings, credential, capabilities=["codex.execute"]
+    )
+    start = Event()
+
+    def create(index):
+        service = pilot.WorkerControlPlaneService(settings)
+        try:
+            start.wait(timeout=5)
+            payload = {
+                "task_type": "codex.execute",
+                "target": {
+                    "host": "DESKTOP-87SSHTU",
+                    "repository": "boonlei/HermesServerWorker",
+                    "path_id": "hermes-server-worker",
+                    "branch": "main",
+                    "expected_head": f"{index + 1:040x}",
+                },
+                "instruction": {
+                    "task_id": f"concurrent-{index}",
+                    "text": "Read only.",
+                    "mode": "read_only",
+                },
+                "limits": {
+                    "timeout_seconds": 900,
+                    "max_result_bytes": 32768,
+                },
+            }
+            return service.enqueue_codex_execute(
+                payload, f"concurrent-{index}"
+            )
+        finally:
+            service.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(create, index) for index in range(2)]
+        start.set()
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(("created", future.result(timeout=10)))
+            except WorkerControlPlaneError as exc:
+                outcomes.append(("rejected", (exc.code, exc.status)))
+
+    assert [kind for kind, _ in outcomes].count("created") == 1
+    assert [value for kind, value in outcomes if kind == "rejected"] == [
+        ("state_conflict", 409)
+    ]
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_tasks "
+            "WHERE task_type='codex.execute' "
+            "AND state IN ('queued','leased','running')"
+        ).fetchone()[0] == 1
+    finally:
+        service.close()
+
+
+def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
+    tmp_path, monkeypatch
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=MutableClock())
+    provisioned = service.provision_worker(capabilities=["codex.execute"])
+    instance_id = str(uuid.uuid4())
+    _, registration = service.register_worker(
+        {
+            "protocol_version": "1.0",
+            "worker_id": "server-a-worker",
+            "instance_id": instance_id,
+            "worker_name": "transaction boundary worker",
+            "worker_version": "0.1.0",
+            "capabilities": ["codex.execute"],
+        },
+        provisioned["secret"],
+    )
+    identity = {
+        "worker_id": "server-a-worker",
+        "instance_id": instance_id,
+        "registration_id": registration["registration_id"],
+    }
+    payload = {
+        "task_type": "codex.execute",
+        "target": {
+            "host": "DESKTOP-87SSHTU",
+            "repository": "boonlei/HermesServerWorker",
+            "path_id": "hermes-server-worker",
+            "branch": "main",
+            "expected_head": "a" * 40,
+        },
+        "instruction": {
+            "task_id": "auth-transaction-boundary",
+            "text": "Read only.",
+            "mode": "read_only",
+        },
+        "limits": {
+            "timeout_seconds": 120,
+            "max_result_bytes": 32768,
+        },
+    }
+    task_id = service.enqueue_codex_execute(
+        payload, "auth-transaction-task"
+    )
+    revoker = pilot.WorkerControlPlaneService(
+        settings, clock=MutableClock()
+    )
+    auth_verified = Event()
+    release_poll = Event()
+    revoke_begin = Event()
+    revoke_acquired = Event()
+    original_access = service.auth.access
+    original_transaction = revoker.store.transaction
+
+    def paused_access(connection, token):
+        row = original_access(connection, token)
+        assert connection.in_transaction
+        auth_verified.set()
+        if not release_poll.wait(timeout=5):
+            raise AssertionError("poll transaction release timed out")
+        return row
+
+    @contextmanager
+    def observed_revoke_transaction():
+        revoke_begin.set()
+        with original_transaction() as connection:
+            revoke_acquired.set()
+            yield connection
+
+    monkeypatch.setattr(service.auth, "access", paused_access)
+    monkeypatch.setattr(
+        revoker.store, "transaction", observed_revoke_transaction
+    )
+
+    def poll():
+        return service.poll_one_task(
+            identity
+            | {
+                "capabilities": ["codex.execute"],
+                "max_tasks": 1,
+                "wait_seconds": 0,
+            },
+            registration["access_token"],
+            "auth-transaction-poll",
+        )
+
+    def revoke():
+        return revoker.revoke_registration(
+            "server-a-worker",
+            instance_id,
+            registration["registration_id"],
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            poll_future = executor.submit(poll)
+            assert auth_verified.wait(timeout=5)
+            revoke_future = executor.submit(revoke)
+            assert revoke_begin.wait(timeout=5)
+            assert not revoke_acquired.wait(timeout=0.2)
+            release_poll.set()
+            envelope = poll_future.result(timeout=5)
+            revoked = revoke_future.result(timeout=5)
+
+        assert envelope["task"]["task_id"] == task_id
+        assert revoked["status"] == "revoked"
+        assert revoke_acquired.is_set()
+        assert service.store.conn.execute(
+            "SELECT state FROM worker_deliveries WHERE task_id=?",
+            (task_id,),
+        ).fetchone()["state"] == "expired"
+        assert service.task_state(task_id) == "queued"
+    finally:
+        release_poll.set()
+        revoker.close()
+        service.close()
 
 
 @pytest.mark.asyncio
@@ -1087,12 +1317,14 @@ def test_provisioning_writes_exact_secret_only_artifact_and_safe_report(
     assert _mode(destination) == 0o600
     assert report["single_use"] is True
     assert set(report) == {
+        "capabilities",
         "credential_id",
         "expires_at",
         "single_use",
         "transfer_file_sha256",
     }
     assert report["transfer_file_sha256"] == pilot.hashlib.sha256(raw).hexdigest()
+    assert report["capabilities"] == ["system.echo"]
     assert secret not in json.dumps(report)
 
     service = pilot.WorkerControlPlaneService(settings)
@@ -1231,6 +1463,10 @@ def _create_v2_database(path):
     access_id = "00000000-0000-4000-8000-000000000202"
     registration_id = "00000000-0000-4000-8000-000000000203"
     instance_id = "00000000-0000-4000-8000-000000000204"
+    task_id = "00000000-0000-4000-8000-000000000205"
+    delivery_id = "00000000-0000-4000-8000-000000000206"
+    result_id = "00000000-0000-4000-8000-000000000207"
+    trace_id = "00000000-0000-4000-8000-000000000208"
     salt, digest = bootstrap_record(secret)
     migrations = (
         ("worker_control_plane_schema_v1", "2026-07-22 11:57:47"),
@@ -1319,6 +1555,59 @@ def _create_v2_database(path):
             "v2-fixture",
         ),
     )
+    payload_json = '{"message":"v2-completed-history"}'
+    payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
+    connection.execute(
+        "INSERT INTO worker_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            task_id,
+            "system.echo",
+            payload_json,
+            payload_hash,
+            "completed",
+            "2026-01-01T00:01:00Z",
+            "2026-01-01T00:01:00Z",
+            None,
+            1,
+            3,
+            "v2-task",
+            trace_id,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_deliveries VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            delivery_id,
+            task_id,
+            "server-a-worker",
+            registration_id,
+            1,
+            "completed",
+            "2026-01-01T00:01:01Z",
+            "2026-01-01T00:01:31Z",
+            "2026-01-01T00:06:01Z",
+            "2026-01-01T00:01:02Z",
+            "2026-01-01T00:01:03Z",
+        ),
+    )
+    connection.execute(
+        "INSERT INTO worker_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            result_id,
+            task_id,
+            delivery_id,
+            "v2-result",
+            "b" * 64,
+            "completed",
+            "v2-completed-history",
+            "",
+            0,
+            "2026-01-01T00:01:02Z",
+            "2026-01-01T00:01:03Z",
+            1000,
+            "2026-01-01T00:01:03Z",
+        ),
+    )
     connection.commit()
     connection.close()
     path.chmod(0o600)
@@ -1328,6 +1617,9 @@ def _create_v2_database(path):
         "access_id": access_id,
         "registration_id": registration_id,
         "instance_id": instance_id,
+        "task_id": task_id,
+        "delivery_id": delivery_id,
+        "result_id": result_id,
         "migrations": migrations,
     }
 
@@ -1519,7 +1811,15 @@ def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
             "single_use",
             "consumed_at",
             "lifecycle_version",
+            "capabilities_json",
         } <= columns.keys()
+        task_columns = {
+            row["name"]
+            for row in service.store.conn.execute(
+                "PRAGMA table_info(worker_tasks)"
+            )
+        }
+        assert "worker_id" in task_columns
         migrations = service.store.conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
@@ -1528,6 +1828,7 @@ def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
                 "worker_control_plane_schema_v1",
                 "worker_control_plane_bootstrap_lifecycle_v2",
                 wcp_storage.LIFECYCLE_MIGRATION_V3,
+                wcp_storage.CAPABILITY_MIGRATION_V4,
             }
         )
     finally:
@@ -1600,6 +1901,21 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             "PRAGMA table_info(worker_credentials)"
         )
     ]
+    task_history_before = tuple(
+        connection.execute(
+            "SELECT * FROM worker_tasks ORDER BY task_id"
+        ).fetchone()
+    )
+    delivery_history_before = tuple(
+        connection.execute(
+            "SELECT * FROM worker_deliveries ORDER BY delivery_id"
+        ).fetchone()
+    )
+    result_history_before = tuple(
+        connection.execute(
+            "SELECT * FROM worker_results ORDER BY result_id"
+        ).fetchone()
+    )
     connection.close()
 
     service = pilot.WorkerControlPlaneService(settings, clock=clock)
@@ -1610,19 +1926,46 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
                 "PRAGMA table_info(worker_credentials)"
             )
         ]
-        assert columns == [*v2_columns, "lifecycle_version"]
+        assert columns == [
+            *v2_columns,
+            "lifecycle_version",
+            "capabilities_json",
+        ]
         migrations = {
             row["version"]: row["applied_at"]
             for row in service.store.conn.execute(
                 "SELECT version,applied_at FROM schema_migrations"
             )
         }
-        assert len(migrations) == 3
+        assert len(migrations) == 4
         assert tuple(
             (name, migrations[name]) for name, _ in legacy["migrations"]
         ) == legacy["migrations"]
         assert wcp_storage.LIFECYCLE_MIGRATION_V3 in migrations
+        assert wcp_storage.CAPABILITY_MIGRATION_V4 in migrations
         assert _v2_business_snapshot(settings.db_path) == before
+        task_history_after = tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_tasks ORDER BY task_id"
+            ).fetchone()
+        )
+        assert task_history_after == (
+            *task_history_before,
+            "server-a-worker",
+        )
+        assert tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_deliveries ORDER BY delivery_id"
+            ).fetchone()
+        ) == delivery_history_before
+        assert tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_results ORDER BY result_id"
+            ).fetchone()
+        ) == result_history_before
+        assert service.store.conn.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchone() is None
 
         credentials = service.store.conn.execute(
             "SELECT credential_id,lifecycle_version FROM worker_credentials "
@@ -1760,7 +2103,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             )
         }
         assert second_applied_at == applied_at
-        assert len(second_applied_at) == 3
+        assert len(second_applied_at) == 4
         reopened.check_health()
     finally:
         reopened.close()
@@ -2077,10 +2420,14 @@ def test_concurrent_v2_migration_deterministically_contends_for_lock(
         "single_use",
         "consumed_at",
         "lifecycle_version",
+        "capabilities_json",
     } <= columns
     assert alter_statements == [
         "ALTER TABLE worker_credentials ADD COLUMN lifecycle_version "
-        "INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_version IN (0,3))"
+        "INTEGER NOT NULL DEFAULT 0 CHECK(lifecycle_version IN (0,3))",
+        "ALTER TABLE worker_credentials ADD COLUMN capabilities_json "
+        "TEXT NOT NULL DEFAULT '[\"system.echo\"]'",
+        "ALTER TABLE worker_tasks_v4 RENAME TO worker_tasks",
     ]
     assert connection.execute(
         "SELECT count(*) FROM schema_migrations WHERE version=?",
@@ -2231,11 +2578,13 @@ def test_provision_cli_prints_only_safe_metadata(monkeypatch, tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     secret = destination.read_text(encoding="utf-8")
     assert set(report) == {
+        "capabilities",
         "credential_id",
         "expires_at",
         "single_use",
         "transfer_file_sha256",
     }
+    assert report["capabilities"] == ["system.echo"]
     assert secret not in json.dumps(report)
     assert report["transfer_file_sha256"] == pilot.hashlib.sha256(
         destination.read_bytes()
