@@ -116,9 +116,13 @@ closed and contains:
 `truncated` is optional; every other field is required. Rules:
 
 - `status` is `completed`, `failed`, `rejected`, or `timed_out`.
-- `classification` and guard names are safe bounded identifiers.
+- status/classification pairing is closed and exact: `completed`/`success`,
+  `failed`/`execution_failure`, `rejected`/`guard_failure`, and
+  `timed_out`/`timeout`.
 - `guards` has at most 32 boolean entries.
 - `summary` is non-empty and bounded by the fixed stdout limit.
+- instructions and Result JSON reject every UTF-16 surrogate code point;
+  valid supplementary Unicode scalar values remain valid UTF-8.
 - `exit_code` and `duration_ms` are integers; duration is non-negative.
 - `completed` requires `failure_code: null` and `exit_code: 0`.
 - `failed` requires a non-zero exit and one of `post_guard_failed`,

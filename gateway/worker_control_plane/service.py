@@ -175,7 +175,10 @@ class WorkerControlPlaneService:
   return self._enqueue_task('system.echo',payload,key,'server-a-worker')
  def enqueue_codex_execute(self,payload,key,worker_id=CODEX_EXECUTE_WORKER_ID):
   if worker_id!=CODEX_EXECUTE_WORKER_ID: raise error('unsupported_capability')
-  payload=validate_codex_execute_payload(payload)
+  try:
+   payload=validate_codex_execute_payload(payload)
+  except ValueError:
+   raise error('invalid_task_payload') from None
   return self._enqueue_task('codex.execute',payload,key,worker_id)
  def create_test_echo_task(self,payload,key):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
@@ -365,12 +368,17 @@ class WorkerControlPlaneService:
    if delivery['worker_id']!=row['worker_id'] or delivery['registration_id']!=row['registration_id']: raise error('worker_not_authorized')
    if delivery['task_type']!=d.get('task_type'): raise error('invalid_result')
    payload=json.loads(delivery['payload_json'])
-   result_size=len(d['stdout'].encode())
    if delivery['task_type']=='system.echo':
+    result_size=len(d['stdout'].encode())
     if d['status']=='timed_out': raise error('invalid_result')
     if len(d['stdout'].encode())>self.settings.max_stdout_bytes or len(d['stderr'].encode())>self.settings.max_stderr_bytes: raise error('payload_too_large')
    else:
-    if d['stderr']!='' or result_size>CODEX_EXECUTE_MAX_RESULT_BYTES: raise error('payload_too_large' if result_size>CODEX_EXECUTE_MAX_RESULT_BYTES else 'invalid_result')
+    if d['stderr']!='': raise error('invalid_result')
+    try:
+     result_size=len(d['stdout'].encode('utf-8'))
+    except UnicodeEncodeError:
+     raise error('invalid_result') from None
+    if result_size>CODEX_EXECUTE_MAX_RESULT_BYTES: raise error('payload_too_large')
     try: inner=validate_codex_execute_result(d['stdout'])
     except ValueError: raise error('invalid_result') from None
     timeout_ms=payload['timeout_seconds']*1000

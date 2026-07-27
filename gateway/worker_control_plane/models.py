@@ -14,6 +14,12 @@ CODEX_EXECUTE_MODE = "read_only"
 CODEX_EXECUTE_MAX_INSTRUCTION_BYTES = 8 * 1024
 CODEX_EXECUTE_MAX_RESULT_BYTES = 32 * 1024
 CODEX_EXECUTE_RESULT_GRACE_SECONDS = 5
+CODEX_EXECUTE_CLASSIFICATION_BY_STATUS = {
+    "completed": "success",
+    "failed": "execution_failure",
+    "rejected": "guard_failure",
+    "timed_out": "timeout",
+}
 CODEX_EXECUTE_FAILURE_CODES_BY_STATUS = {
     "failed": {
         "post_guard_failed",
@@ -32,6 +38,18 @@ CODEX_EXECUTE_RESULT_STATUSES = {
     "rejected",
     "timed_out",
 }
+
+def _reject_unicode_surrogates(value: object) -> None:
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ValueError("invalid_unicode")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_unicode_surrogates(key)
+            _reject_unicode_surrogates(item)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_unicode_surrogates(item)
 
 def canonical_json_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -62,13 +80,18 @@ def validate_codex_execute_payload(payload: object) -> dict:
         "path_id", "mode", "instruction", "timeout_seconds"
     }:
         raise ValueError("invalid_task_payload")
+    instruction = payload["instruction"]
+    if not isinstance(instruction, str):
+        raise ValueError("invalid_task_payload")
+    try:
+        instruction_bytes = instruction.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("invalid_task_payload") from None
     if (
         payload["path_id"] != CODEX_EXECUTE_PATH_ID
         or payload["mode"] != CODEX_EXECUTE_MODE
-        or not isinstance(payload["instruction"], str)
-        or not payload["instruction"]
-        or len(payload["instruction"].encode("utf-8"))
-        > CODEX_EXECUTE_MAX_INSTRUCTION_BYTES
+        or not instruction
+        or len(instruction_bytes) > CODEX_EXECUTE_MAX_INSTRUCTION_BYTES
         or type(payload["timeout_seconds"]) is not int
         or not 60 <= payload["timeout_seconds"] <= 900
     ):
@@ -76,7 +99,7 @@ def validate_codex_execute_payload(payload: object) -> dict:
     return {
         "path_id": CODEX_EXECUTE_PATH_ID,
         "mode": CODEX_EXECUTE_MODE,
-        "instruction": payload["instruction"],
+        "instruction": instruction,
         "timeout_seconds": payload["timeout_seconds"],
     }
 
@@ -84,8 +107,12 @@ def validate_codex_execute_result(value: object) -> dict:
     if not isinstance(value, str) or not value:
         raise ValueError("invalid_result")
     try:
+        encoded = value.encode("utf-8")
+        if len(encoded) > CODEX_EXECUTE_MAX_RESULT_BYTES:
+            raise ValueError("invalid_result")
         result = json.loads(value)
-    except (TypeError, ValueError, json.JSONDecodeError):
+        _reject_unicode_surrogates(result)
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeEncodeError):
         raise ValueError("invalid_result") from None
     if not isinstance(result, dict):
         raise ValueError("invalid_result")
@@ -110,8 +137,8 @@ def validate_codex_execute_result(value: object) -> dict:
     if result["status"] not in CODEX_EXECUTE_RESULT_STATUSES:
         raise ValueError("invalid_result")
     if (
-        not isinstance(result["classification"], str)
-        or not SAFE_RESULT_IDENTIFIER_RE.fullmatch(result["classification"])
+        result["classification"]
+        != CODEX_EXECUTE_CLASSIFICATION_BY_STATUS[result["status"]]
         or not isinstance(result["summary"], str)
         or not result["summary"]
         or len(result["summary"].encode("utf-8"))
