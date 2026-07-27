@@ -115,6 +115,11 @@ GOLDEN_FIXTURE_NAMES = {
     "result_failed.json",
     "result_rejected.json",
     "result_timed_out.json",
+    "result_worker_execution_failed.json",
+    "result_worker_execution_timed_out.json",
+    "result_worker_invalid_result.json",
+    "result_worker_post_guard_failed.json",
+    "result_worker_process_adapter_failed.json",
 }
 
 
@@ -1210,6 +1215,11 @@ def test_codex_execute_golden_fixture_manifest_is_exact_and_canonical():
         "result_failed.json": "failed",
         "result_rejected.json": "rejected",
         "result_timed_out.json": "timed_out",
+        "result_worker_execution_failed.json": "failed",
+        "result_worker_execution_timed_out.json": "timed_out",
+        "result_worker_invalid_result.json": "failed",
+        "result_worker_post_guard_failed.json": "failed",
+        "result_worker_process_adapter_failed.json": "failed",
     }.items():
         result = _load_golden_fixture(name)
         inner = validate_codex_execute_result(result["stdout"])
@@ -1242,6 +1252,49 @@ def test_codex_execute_golden_fixture_manifest_is_exact_and_canonical():
 
 
 @pytest.mark.parametrize(
+    ("fixture_name", "expected_status", "expected_failure_code"),
+    (
+        (
+            "result_worker_post_guard_failed.json",
+            "failed",
+            "post_guard_failed",
+        ),
+        (
+            "result_worker_process_adapter_failed.json",
+            "failed",
+            "process_adapter_failed",
+        ),
+        (
+            "result_worker_execution_timed_out.json",
+            "timed_out",
+            "execution_timed_out",
+        ),
+        (
+            "result_worker_execution_failed.json",
+            "failed",
+            "execution_failed",
+        ),
+        (
+            "result_worker_invalid_result.json",
+            "failed",
+            "invalid_result",
+        ),
+    ),
+)
+def test_codex_execute_worker_failure_vectors_are_accepted(
+    fixture_name, expected_status, expected_failure_code
+):
+    vector = _load_golden_fixture(fixture_name)
+    inner = validate_codex_execute_result(vector["stdout"])
+
+    assert vector["stderr"] == ""
+    assert vector["status"] == inner["status"] == expected_status
+    assert inner["failure_code"] == expected_failure_code
+    assert vector["exit_code"] == inner["exit_code"]
+    assert vector["duration_ms"] == inner["duration_ms"]
+
+
+@pytest.mark.parametrize(
     ("status", "failure_code"),
     (
         ("failed", "guard_rejected"),
@@ -1258,6 +1311,41 @@ def test_codex_execute_failure_codes_are_status_specific(
                 status=status,
                 failure_code=failure_code,
                 exit_code=1,
+            )
+        )
+
+
+def test_codex_execute_unknown_failure_code_is_rejected():
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(
+                status="failed",
+                classification="execution_failure",
+                failure_code="unknown_failure",
+                exit_code=1,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "classification", "failure_code", "exit_code"),
+    (
+        ("completed", "success", "worker_error", 0),
+        ("failed", "execution_failure", None, 1),
+        ("rejected", "guard_failure", None, 1),
+        ("timed_out", "timeout", None, 124),
+    ),
+)
+def test_codex_execute_failure_code_nullability_matches_status(
+    status, classification, failure_code, exit_code
+):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(
+                status=status,
+                classification=classification,
+                failure_code=failure_code,
+                exit_code=exit_code,
             )
         )
 

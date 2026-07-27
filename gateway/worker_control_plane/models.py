@@ -15,9 +15,16 @@ CODEX_EXECUTE_MAX_INSTRUCTION_BYTES = 8 * 1024
 CODEX_EXECUTE_MAX_RESULT_BYTES = 32 * 1024
 CODEX_EXECUTE_RESULT_GRACE_SECONDS = 5
 CODEX_EXECUTE_FAILURE_CODES_BY_STATUS = {
-    "failed": {"codex_failed", "worker_error"},
+    "failed": {
+        "post_guard_failed",
+        "process_adapter_failed",
+        "execution_failed",
+        "invalid_result",
+        "codex_failed",
+        "worker_error",
+    },
     "rejected": {"guard_rejected", "repository_mismatch"},
-    "timed_out": {"timeout"},
+    "timed_out": {"execution_timed_out", "timeout"},
 }
 CODEX_EXECUTE_RESULT_STATUSES = {
     "completed",
