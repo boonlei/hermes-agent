@@ -8,11 +8,14 @@ class WorkerControlPlaneError(Exception):
     status: int = 400
     retryable: bool = False
     message: str = "Request rejected"
+    request_id: str | None = None
+    audit_id: int | None = None
+    safe_context: dict | None = None
 
 ERRORS = {
  "invalid_credential": (401, "Authentication failed"), "worker_revoked": (403, "Worker is revoked"),
  "worker_not_authorized": (403, "Worker is not authorized"), "task_not_found": (404, "Task not found"),
- "duplicate_active_instance": (409, "An active instance already exists"), "state_conflict": (409, "State conflict"),
+ "duplicate_active_instance": (409, "An active instance already exists"), "instance_conflict": (409, "Instance identity conflicts with existing registration"), "state_conflict": (409, "State conflict"),
  "idempotency_conflict": (409, "Idempotency key conflicts with the original request"),
  "stale_delivery": (409, "Stale delivery"), "registration_expired": (410, "Registration expired"),
  "lease_expired": (410, "Lease expired"), "payload_too_large": (413, "Payload too large"),

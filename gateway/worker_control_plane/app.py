@@ -91,7 +91,11 @@ def _result(body: dict, route_task_id: str) -> None:
     require_timestamp(body["started_at"], "started_at"); require_timestamp(body["finished_at"], "finished_at")
 
 def _failure(exc: WorkerControlPlaneError) -> web.Response:
-    return web.json_response({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable, "trace_id": str(uuid.uuid4())}}, status=exc.status)
+    request_id = exc.request_id or str(uuid.uuid4())
+    headers = {"X-Request-ID": request_id}
+    if exc.audit_id is not None:
+        headers["X-Audit-Event-ID"] = str(exc.audit_id)
+    return web.json_response({"error": {"code": exc.code, "message": exc.message, "retryable": exc.retryable, "trace_id": request_id}}, status=exc.status, headers=headers)
 
 def _http_failure(exc: web.HTTPException) -> web.Response:
     if isinstance(exc, web.HTTPNotFound):
@@ -155,11 +159,55 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         svc.check_health()
         return web.json_response({"status": "ok"})
 
-    @audited("registration_rejected")
     async def register(request: web.Request):
-        body = await _json(request, REGISTER); _register(body)
-        status, response = svc.register_worker(body, _token(request, "Worker-Bootstrap"))
-        return web.json_response(response, status=status)
+        request_id = str(uuid.uuid4())
+        body = None
+        try:
+            body = await _json(request, REGISTER); _register(body)
+            evidence = {}
+            status, response = svc.register_worker(
+                body,
+                _token(request, "Worker-Bootstrap"),
+                request_id=request_id,
+                evidence=evidence,
+            )
+            return web.json_response(
+                response,
+                status=status,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Audit-Event-ID": str(evidence["audit_id"]),
+                },
+            )
+        except WorkerControlPlaneError as exc:
+            context = exc.safe_context or {}
+            if exc.audit_id is None:
+                exc.request_id = request_id
+                exc.audit_id = svc.record_registration_failure(
+                    request_id=request_id,
+                    worker_id=context.get("worker_id") or (body.get("worker_id") if isinstance(body, dict) and isinstance(body.get("worker_id"), str) else None),
+                    instance_id=context.get("instance_id") or (body.get("instance_id") if isinstance(body, dict) and isinstance(body.get("instance_id"), str) else None),
+                    credential_id=context.get("credential_id"),
+                    registration_id=context.get("registration_id"),
+                    http_status=exc.status,
+                    error_code=exc.code,
+                    lifecycle_outcome=context.get("registration_lifecycle_outcome", "request_rejected"),
+                )
+            raise
+        except (TypeError, ValueError, KeyError):
+            exc = error("malformed_request")
+            exc.request_id = request_id
+            exc.audit_id = svc.record_registration_failure(
+                request_id=request_id,
+                worker_id=body.get("worker_id") if isinstance(body, dict) and isinstance(body.get("worker_id"), str) else None,
+                instance_id=body.get("instance_id") if isinstance(body, dict) and isinstance(body.get("instance_id"), str) else None,
+                credential_id=None,
+                registration_id=None,
+                http_status=exc.status,
+                error_code=exc.code,
+                lifecycle_outcome="request_rejected",
+            )
+            raise exc
     @audited("heartbeat_rejected")
     async def heartbeat(request: web.Request):
         body = await _json(request, HEARTBEAT); _heartbeat(body)

@@ -14,13 +14,19 @@ class MockWorkerClient:
         self.registration_id = None
         self.access_token = None
 
-    async def register(self, *, capabilities=None, protocol_version="1.0"):
+    async def register(
+        self,
+        *,
+        capabilities=None,
+        protocol_version="1.0",
+        worker_version="0.1.0",
+    ):
         response = await self.client.post(
             "/worker/v1/register",
             headers={"Authorization": f"Worker-Bootstrap {self.bootstrap_secret}"},
             json={"protocol_version": protocol_version, "worker_id": self.worker_id,
                   "instance_id": self.instance_id, "worker_name": "test worker",
-                  "worker_version": "0.1.0", "capabilities": capabilities or ["system.echo"]},
+                  "worker_version": worker_version, "capabilities": capabilities or ["system.echo"]},
         )
         body = await response.json()
         if response.status in (200, 201):

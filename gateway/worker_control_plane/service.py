@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from .auth import bootstrap_record, verify_bootstrap, new_access_token, verify_access_token
 from .config import WorkerControlPlaneSettings
-from .errors import error
+from .errors import WorkerControlPlaneError, error
 from .models import canonical_json_hash, validate_system_echo_payload
 from .storage import CURRENT_LIFECYCLE_VERSION, WorkerControlPlaneStore
 
@@ -57,9 +57,18 @@ class WorkerControlPlaneService:
  def close(self): self.store.close()
  def _audit(self,c,event,**fields):
   safe={k:v for k,v in fields.items() if k in {'worker_id','instance_id','registration_id','task_id','delivery_id','trace_id','outcome','reason_code'}}
-  c.execute("INSERT INTO worker_audit_log(occurred_at,event_type,worker_id,instance_id,registration_id,task_id,delivery_id,trace_id,outcome,reason_code) VALUES(?,?,?,?,?,?,?,?,?,?)",(self.now(),event,safe.get('worker_id'),safe.get('instance_id'),safe.get('registration_id'),safe.get('task_id'),safe.get('delivery_id'),safe.get('trace_id'),safe.get('outcome','ok'),safe.get('reason_code')))
+  details=fields.get('details')
+  details_json=json.dumps(details,sort_keys=True,separators=(',',':')) if details is not None else None
+  cursor=c.execute("INSERT INTO worker_audit_log(occurred_at,event_type,worker_id,instance_id,registration_id,task_id,delivery_id,trace_id,outcome,reason_code,details_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(self.now(),event,safe.get('worker_id'),safe.get('instance_id'),safe.get('registration_id'),safe.get('task_id'),safe.get('delivery_id'),safe.get('trace_id'),safe.get('outcome','ok'),safe.get('reason_code'),details_json))
+  return cursor.lastrowid
  def record_rejection(self,event,**fields):
-  with self.store.transaction() as c: self._audit(c,event,outcome='rejected',**fields)
+  with self.store.transaction() as c: return self._audit(c,event,outcome='rejected',**fields)
+ def record_registration_failure(self, *, request_id, worker_id, instance_id, credential_id, registration_id, http_status, error_code, lifecycle_outcome):
+  details={'request_id':request_id,'http_status':http_status,'error_code':error_code,'worker_id':worker_id,'instance_id':instance_id,'credential_id':credential_id,'registration_lifecycle_outcome':lifecycle_outcome}
+  with self.store.transaction() as c:
+   if error_code=='invalid_credential':
+    self._audit(c,'credential_failed',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id,outcome='rejected',reason_code=error_code)
+   return self._audit(c,'registration_rejected',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id,outcome='rejected',reason_code=error_code,details=details)
  def provision_worker(self, *, secret=None, ttl_seconds=900, single_use=True, install_credential=None):
   if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
   if type(ttl_seconds) is not int or not 1<=ttl_seconds<=900: raise ValueError('bootstrap TTL must be between 1 and 900 seconds')
@@ -137,31 +146,65 @@ class WorkerControlPlaneService:
  def create_test_echo_task(self,payload,key):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
   return self.enqueue_system_echo(payload,key)
- def register_worker(self,d,secret):
-  if d.get('protocol_version')!='1.0': raise error('unsupported_protocol')
-  if d.get('worker_id')!='server-a-worker' or d.get('capabilities') != ['system.echo']: raise error('unsupported_capability' if d.get('worker_id')=='server-a-worker' else 'invalid_credential')
-  iid=d.get('instance_id')
-  try: uuid.UUID(iid)
-  except Exception: raise error('malformed_request')
-  with self.store.transaction() as c:
-   bootstrap=self.auth.bootstrap(c,d['worker_id'],secret)
-   active=c.execute("SELECT * FROM worker_instances WHERE worker_id=? AND status='active'",(d['worker_id'],)).fetchone()
-   if active and active['instance_id'] != iid: self._audit(c,'registration_rejected',worker_id=d['worker_id'],outcome='rejected',reason_code='duplicate_active_instance'); raise error('duplicate_active_instance')
-   token,thash=new_access_token(); cid=str(uuid.uuid4()); expiry=(self._now_datetime()+timedelta(seconds=self.settings.token_ttl_seconds)).isoformat().replace('+00:00','Z')
-   if active:
-    c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=?",(self.now(),active['access_credential_id'])); rid=active['registration_id']; status=200; event='worker_reregistered'
-   else:
-    rid=str(uuid.uuid4()); status=201; event='worker_registered'
-   c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version) VALUES(?,?,?,?,?,?,?,?,0,NULL,?)",(cid,d['worker_id'],'access',thash,None,self.now(),expiry,None,CURRENT_LIFECYCLE_VERSION))
-   if active: c.execute("UPDATE worker_instances SET access_credential_id=?,last_seen_at=? WHERE registration_id=?",(cid,self.now(),rid))
-   else: c.execute("INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,d['worker_id'],iid,'active',d.get('worker_version','0'),d['protocol_version'],self.now(),self.now(),cid,None))
-   if bootstrap['single_use']:
-    consumed_at=self.now()
-    changed=c.execute("UPDATE worker_credentials SET consumed_at=?,revoked_at=? WHERE credential_id=? AND consumed_at IS NULL AND revoked_at IS NULL",(consumed_at,consumed_at,bootstrap['credential_id'])).rowcount
-    if changed!=1: raise error('invalid_credential')
-    self._audit(c,'bootstrap_credential_consumed',worker_id=d['worker_id'],registration_id=rid,reason_code=bootstrap['credential_id'])
-   self._audit(c,event,worker_id=d['worker_id'],instance_id=iid,registration_id=rid)
-  return status,{'registration_id':rid,'worker_id':d['worker_id'],'accepted_capabilities':['system.echo'],'access_token':token,'access_token_expires_at':expiry,'heartbeat_interval_seconds':self.settings.heartbeat_seconds,'ack_deadline_seconds':self.settings.ack_deadline_seconds,'lease_seconds':self.settings.lease_seconds,'server_time':self.now()}
+ def _invalidate_registration_deliveries(self,c,registration_id):
+  rows=c.execute("SELECT d.delivery_id,d.task_id,d.attempt,t.max_attempts FROM worker_deliveries d JOIN worker_tasks t USING(task_id) WHERE d.registration_id=? AND d.state IN ('leased','acknowledged')",(registration_id,)).fetchall()
+  for row in rows:
+   task_state='dead_letter' if row['attempt']>=row['max_attempts'] else 'queued'
+   c.execute("UPDATE worker_deliveries SET state='expired' WHERE delivery_id=?",(row['delivery_id'],))
+   c.execute("UPDATE worker_tasks SET state=?,leased_until=NULL WHERE task_id=?",(task_state,row['task_id']))
+   self._audit(c,'registration_delivery_invalidated',registration_id=registration_id,task_id=row['task_id'],delivery_id=row['delivery_id'],reason_code='registration_lifecycle_rotated')
+   self._audit(c,'task_dead_lettered' if task_state=='dead_letter' else 'task_redelivered',registration_id=registration_id,task_id=row['task_id'],delivery_id=row['delivery_id'],reason_code='registration_lifecycle_rotated')
+ def _retire_registration_dedup(self,c,registration_id,access_credential_id):
+  retired_scope=f"{registration_id}:{access_credential_id}"
+  changed=c.execute("UPDATE worker_request_dedup SET registration_id=? WHERE registration_id=?",(retired_scope,registration_id)).rowcount
+  if changed:
+   self._audit(c,'registration_dedup_retired',registration_id=registration_id,outcome='ok',reason_code='registration_lifecycle_rotated')
+ def register_worker(self,d,secret,*,request_id=None,evidence=None):
+  request_id=request_id or str(uuid.uuid4())
+  worker_id=d.get('worker_id') if isinstance(d.get('worker_id'),str) else None
+  iid=d.get('instance_id') if isinstance(d.get('instance_id'),str) else None
+  credential_id=None; registration_id=None; lifecycle_outcome='request_rejected'
+  try:
+   if d.get('protocol_version')!='1.0': raise error('unsupported_protocol')
+   if d.get('worker_id')!='server-a-worker' or d.get('capabilities') != ['system.echo']: raise error('unsupported_capability' if d.get('worker_id')=='server-a-worker' else 'invalid_credential')
+   try: uuid.UUID(iid)
+   except Exception: raise error('malformed_request')
+   with self.store.transaction() as c:
+    bootstrap=self.auth.bootstrap(c,d['worker_id'],secret); credential_id=bootstrap['credential_id']
+    active=c.execute("SELECT * FROM worker_instances WHERE worker_id=? AND status='active'",(d['worker_id'],)).fetchone()
+    existing=c.execute("SELECT * FROM worker_instances WHERE worker_id=? AND instance_id=?",(d['worker_id'],iid)).fetchone()
+    if active and active['instance_id'] != iid:
+     registration_id=active['registration_id']; lifecycle_outcome='different_active_instance'; raise error('duplicate_active_instance')
+    if existing and existing['protocol_version']!=d['protocol_version']:
+     registration_id=existing['registration_id']; lifecycle_outcome='immutable_metadata_conflict'; raise error('instance_conflict')
+    token,thash=new_access_token(); cid=str(uuid.uuid4()); now=self.now(); expiry=(self._now_datetime()+timedelta(seconds=self.settings.token_ttl_seconds)).isoformat().replace('+00:00','Z')
+    if existing:
+     rid=existing['registration_id']; registration_id=rid
+     self._retire_registration_dedup(c,rid,existing['access_credential_id'])
+     self._invalidate_registration_deliveries(c,rid)
+     c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=? AND revoked_at IS NULL",(now,existing['access_credential_id']))
+     event='worker_reregistered' if existing['status']=='active' else 'worker_reactivated'; lifecycle_outcome='reregistered_active' if existing['status']=='active' else 'reactivated'; status=200
+    else:
+     rid=str(uuid.uuid4()); registration_id=rid; status=201; event='worker_registered'; lifecycle_outcome='registered'
+    c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version) VALUES(?,?,?,?,?,?,?,?,0,NULL,?)",(cid,d['worker_id'],'access',thash,None,now,expiry,None,CURRENT_LIFECYCLE_VERSION))
+    if existing:
+     c.execute("UPDATE worker_instances SET status='active',worker_version=?,access_credential_id=?,last_seen_at=?,current_task_id=NULL WHERE registration_id=?",(d['worker_version'],cid,now,rid))
+    else:
+     c.execute("INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,?)",(rid,d['worker_id'],iid,'active',d.get('worker_version','0'),d['protocol_version'],now,now,cid,None))
+    if bootstrap['single_use']:
+     consumed_at=self.now()
+     changed=c.execute("UPDATE worker_credentials SET consumed_at=?,revoked_at=? WHERE credential_id=? AND consumed_at IS NULL AND revoked_at IS NULL",(consumed_at,consumed_at,bootstrap['credential_id'])).rowcount
+     if changed!=1: raise error('invalid_credential')
+     self._audit(c,'bootstrap_credential_consumed',worker_id=d['worker_id'],registration_id=rid,reason_code=bootstrap['credential_id'])
+    audit_id=self._audit(c,event,worker_id=d['worker_id'],instance_id=iid,registration_id=rid,details={'request_id':request_id,'credential_id':bootstrap['credential_id'],'registration_lifecycle_outcome':lifecycle_outcome})
+   if evidence is not None: evidence.update({'request_id':request_id,'audit_id':audit_id,'credential_id':credential_id,'registration_lifecycle_outcome':lifecycle_outcome})
+   return status,{'registration_id':rid,'worker_id':d['worker_id'],'accepted_capabilities':['system.echo'],'access_token':token,'access_token_expires_at':expiry,'heartbeat_interval_seconds':self.settings.heartbeat_seconds,'ack_deadline_seconds':self.settings.ack_deadline_seconds,'lease_seconds':self.settings.lease_seconds,'server_time':self.now()}
+  except WorkerControlPlaneError as exc:
+   exc.request_id=request_id; exc.safe_context={'worker_id':worker_id,'instance_id':iid,'credential_id':credential_id,'registration_id':registration_id,'registration_lifecycle_outcome':lifecycle_outcome}
+   raise
+  except Exception:
+   exc=WorkerControlPlaneError('internal_error',503,True,'Temporarily unavailable',request_id=request_id,safe_context={'worker_id':worker_id,'instance_id':iid,'credential_id':credential_id,'registration_id':registration_id,'registration_lifecycle_outcome':'transaction_rolled_back'})
+   raise exc from None
  def _context(self,token,d):
   row=self.auth.access(token)
   return self._assert_context(row,d)
@@ -171,14 +214,18 @@ class WorkerControlPlaneService:
   if rid is not None and rid!=row['registration_id']: raise error('state_conflict')
   return row
  def _dedup_replay(self,c,row,d,key,method,route,task_id=''):
-  existing=c.execute("SELECT * FROM worker_request_dedup WHERE worker_id=? AND idempotency_key=?",(row['worker_id'],key)).fetchone()
+  lifecycle_key=f"{row['credential_id']}:{key}"
+  existing=c.execute("SELECT * FROM worker_request_dedup WHERE worker_id=? AND idempotency_key=?",(row['worker_id'],lifecycle_key)).fetchone()
+  if not existing:
+   existing=c.execute("SELECT * FROM worker_request_dedup WHERE worker_id=? AND registration_id=? AND idempotency_key=?",(row['worker_id'],row['registration_id'],key)).fetchone()
   if not existing: return _NO_REPLAY
   expected=(str(d.get('registration_id') or ''),method,route,task_id,canonical_json_hash(d))
   actual=(existing['registration_id'],existing['method'],existing['route'],existing['task_id'],existing['request_body_hash'])
   if actual!=expected: raise error('idempotency_conflict')
   return json.loads(existing['response_json'])
  def _dedup_store(self,c,row,d,key,method,route,task_id,response,status):
-  c.execute("INSERT INTO worker_request_dedup VALUES(?,?,?,?,?,?,?,?,?)",(row['worker_id'],str(d.get('registration_id') or ''),method,route,task_id,key,canonical_json_hash(d),status,json.dumps(response)))
+  lifecycle_key=f"{row['credential_id']}:{key}"
+  c.execute("INSERT INTO worker_request_dedup VALUES(?,?,?,?,?,?,?,?,?)",(row['worker_id'],str(d.get('registration_id') or ''),method,route,task_id,lifecycle_key,canonical_json_hash(d),status,json.dumps(response)))
  def heartbeat(self,d,token):
   row=self._context(token,d)
   if d.get('status') not in ('idle','busy'): raise error('malformed_request')

@@ -274,6 +274,138 @@ async def test_registration_auth_capability_and_instance_guards(control_plane):
 
 
 @pytest.mark.asyncio
+async def test_register_failure_has_correlated_safe_audit_evidence(
+    control_plane
+):
+    service, client, secret = control_plane
+    worker = MockWorkerClient(client, secret)
+    assert (await worker.register())[0] == 201
+    registration_id = worker.registration_id
+    service.revoke_registration(
+        "server-a-worker", worker.instance_id, registration_id
+    )
+    service.store.conn.execute(
+        "UPDATE worker_instances SET protocol_version='2.0' "
+        "WHERE registration_id=?",
+        (registration_id,),
+    )
+    service.store.conn.commit()
+    provisioned = service.provision_worker()
+
+    response = await client.post(
+        "/worker/v1/register",
+        headers={
+            "Authorization": f"Worker-Bootstrap {provisioned['secret']}"
+        },
+        json={
+            "protocol_version": "1.0",
+            "worker_id": "server-a-worker",
+            "instance_id": worker.instance_id,
+            "worker_name": "test worker",
+            "worker_version": "0.1.0",
+            "capabilities": ["system.echo"],
+        },
+    )
+    body = await response.json()
+
+    assert response.status == 409
+    assert body["error"]["code"] == "instance_conflict"
+    assert body["error"]["trace_id"] == response.headers["X-Request-ID"]
+    audit_id = int(response.headers["X-Audit-Event-ID"])
+    audit = service.store.conn.execute(
+        "SELECT * FROM worker_audit_log WHERE audit_id=?", (audit_id,)
+    ).fetchone()
+    details = json.loads(audit["details_json"])
+    assert audit["event_type"] == "registration_rejected"
+    assert audit["outcome"] == "rejected"
+    assert audit["reason_code"] == "instance_conflict"
+    assert details == {
+        "credential_id": provisioned["credential_id"],
+        "error_code": "instance_conflict",
+        "http_status": 409,
+        "instance_id": worker.instance_id,
+        "registration_lifecycle_outcome": "immutable_metadata_conflict",
+        "request_id": response.headers["X-Request-ID"],
+        "worker_id": "server-a-worker",
+    }
+    bootstrap = service.store.conn.execute(
+        "SELECT consumed_at,revoked_at FROM worker_credentials "
+        "WHERE credential_id=?",
+        (provisioned["credential_id"],),
+    ).fetchone()
+    assert bootstrap["consumed_at"] is None
+    assert bootstrap["revoked_at"] is None
+    registration = service.store.conn.execute(
+        "SELECT status FROM worker_instances WHERE registration_id=?",
+        (registration_id,),
+    ).fetchone()
+    assert registration["status"] == "revoked"
+    audit_text = service.audit_text()
+    credential_rows = service.store.conn.execute(
+        "SELECT token_hash,salt FROM worker_credentials"
+    ).fetchall()
+    forbidden = [
+        provisioned["secret"],
+        worker.access_token,
+        f"Worker-Bootstrap {provisioned['secret']}",
+    ]
+    forbidden.extend(value for row in credential_rows for value in row if value)
+    assert all(value not in audit_text for value in forbidden)
+    assert "worker_name" not in audit_text
+    assert "capabilities" not in audit_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_state", ("leased", "acknowledged"))
+async def test_reactivation_invalidates_prior_lifecycle_delivery(
+    control_plane, delivery_state
+):
+    service, _, secret = control_plane
+    worker = MockWorkerClient(control_plane[1], secret)
+    assert (await worker.register())[0] == 201
+    task_id = service.create_test_echo_task(
+        {"message": "lifecycle boundary"}, f"create-{delivery_state}"
+    )
+    status, envelope = await worker.poll(f"poll-{delivery_state}")
+    assert status == 200
+    task = envelope["task"]
+    if delivery_state == "acknowledged":
+        assert (await worker.ack(task, key="old-lifecycle-ack"))[0] == 200
+
+    service.revoke_registration(
+        "server-a-worker", worker.instance_id, worker.registration_id
+    )
+    worker.bootstrap_secret = service.provision_worker()["secret"]
+    assert (await worker.register())[0] == 200
+
+    delivery = service.store.conn.execute(
+        "SELECT state FROM worker_deliveries WHERE delivery_id=?",
+        (task["delivery_id"],),
+    ).fetchone()
+    assert delivery["state"] == "expired"
+    assert service.task_state(task_id) == "queued"
+    assert service.result_count(task_id) == 0
+    status, new_envelope = await worker.poll(f"poll-{delivery_state}")
+    assert status == 200
+    assert new_envelope["task"]["task_id"] == task_id
+    assert new_envelope["task"]["delivery_id"] != task["delivery_id"]
+    if delivery_state == "leased":
+        status, body = await worker.ack(task, key="new-lifecycle-old-ack")
+    else:
+        status, body = await worker.ack(task, key="old-lifecycle-ack")
+        assert status == 410
+        assert body["error"]["code"] == "lease_expired"
+        status, body = await worker.result(
+            task,
+            result_key="new-lifecycle-old-result",
+            request_key="new-lifecycle-old-result-request",
+        )
+    assert status == 410
+    assert body["error"]["code"] == "lease_expired"
+    assert "registration_delivery_invalidated" in service.audit_text()
+
+
+@pytest.mark.asyncio
 async def test_poll_ack_result_validation_and_fifo(control_plane):
     service, client, secret = control_plane
     worker = MockWorkerClient(client, secret)

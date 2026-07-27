@@ -757,6 +757,202 @@ def test_failed_register_does_not_consume_single_use_bootstrap(tmp_path):
         service.close()
 
 
+@pytest.mark.parametrize("inactive_status", ("revoked", "expired", "inactive"))
+def test_inactive_same_instance_reuses_registration_row_and_issues_new_lifecycle(
+    tmp_path, inactive_status
+):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    instance_id = str(uuid.uuid4())
+    body = _registration_body(instance_id)
+    try:
+        first = service.provision_worker(ttl_seconds=900, single_use=True)
+        first_status, first_response = service.register_worker(
+            body, first["secret"]
+        )
+        assert first_status == 201
+        registration_id = first_response["registration_id"]
+        old_access_id = service.store.conn.execute(
+            "SELECT access_credential_id FROM worker_instances "
+            "WHERE registration_id=?",
+            (registration_id,),
+        ).fetchone()["access_credential_id"]
+
+        if inactive_status == "revoked":
+            service.revoke_registration(
+                "server-a-worker", instance_id, registration_id
+            )
+        else:
+            with service.store.transaction() as connection:
+                connection.execute(
+                    "UPDATE worker_instances SET status=? "
+                    "WHERE registration_id=?",
+                    (inactive_status, registration_id),
+                )
+                connection.execute(
+                    "UPDATE worker_credentials SET revoked_at=? "
+                    "WHERE credential_id=?",
+                    (service.now(), old_access_id),
+                )
+
+        second = service.provision_worker(ttl_seconds=900, single_use=True)
+        evidence = {}
+        status, response = service.register_worker(
+            body,
+            second["secret"],
+            request_id=str(uuid.uuid4()),
+            evidence=evidence,
+        )
+
+        assert status == 200
+        assert response["registration_id"] == registration_id
+        assert evidence["registration_lifecycle_outcome"] == "reactivated"
+        registrations = service.store.conn.execute(
+            "SELECT * FROM worker_instances WHERE worker_id=? "
+            "AND instance_id=?",
+            ("server-a-worker", instance_id),
+        ).fetchall()
+        assert len(registrations) == 1
+        assert registrations[0]["status"] == "active"
+        assert registrations[0]["registration_id"] == registration_id
+        assert registrations[0]["access_credential_id"] != old_access_id
+        new_access = service.store.conn.execute(
+            "SELECT lifecycle_version,revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (registrations[0]["access_credential_id"],),
+        ).fetchone()
+        assert new_access["lifecycle_version"] == 3
+        assert new_access["revoked_at"] is None
+        consumed = service.store.conn.execute(
+            "SELECT consumed_at,revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (second["credential_id"],),
+        ).fetchone()
+        assert consumed["consumed_at"] is not None
+        assert consumed["revoked_at"] == consumed["consumed_at"]
+        success_audit = service.store.conn.execute(
+            "SELECT event_type,details_json FROM worker_audit_log "
+            "WHERE audit_id=?",
+            (evidence["audit_id"],),
+        ).fetchone()
+        assert success_audit["event_type"] == "worker_reactivated"
+        assert json.loads(success_audit["details_json"])[
+            "registration_lifecycle_outcome"
+        ] == "reactivated"
+    finally:
+        service.close()
+
+
+def test_incompatible_inactive_instance_metadata_returns_409_without_mutation(
+    tmp_path
+):
+    clock = MutableClock()
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    service = pilot.WorkerControlPlaneService(settings, clock=clock)
+    instance_id = str(uuid.uuid4())
+    body = _registration_body(instance_id)
+    try:
+        first = service.provision_worker(ttl_seconds=900, single_use=True)
+        _, first_response = service.register_worker(body, first["secret"])
+        service.revoke_registration(
+            "server-a-worker",
+            instance_id,
+            first_response["registration_id"],
+        )
+        second = service.provision_worker(ttl_seconds=900, single_use=True)
+        service.store.conn.execute(
+            "UPDATE worker_instances SET protocol_version='2.0' "
+            "WHERE registration_id=?",
+            (first_response["registration_id"],),
+        )
+        service.store.conn.commit()
+        before = tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_instances WHERE registration_id=?",
+                (first_response["registration_id"],),
+            ).fetchone()
+        )
+        incompatible = body
+
+        with pytest.raises(WorkerControlPlaneError) as exc:
+            service.register_worker(incompatible, second["secret"])
+
+        assert (exc.value.code, exc.value.status) == (
+            "instance_conflict",
+            409,
+        )
+        assert exc.value.safe_context[
+            "registration_lifecycle_outcome"
+        ] == "immutable_metadata_conflict"
+        after = tuple(
+            service.store.conn.execute(
+                "SELECT * FROM worker_instances WHERE registration_id=?",
+                (first_response["registration_id"],),
+            ).fetchone()
+        )
+        assert after == before
+        bootstrap = service.store.conn.execute(
+            "SELECT consumed_at,revoked_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (second["credential_id"],),
+        ).fetchone()
+        assert bootstrap["consumed_at"] is None
+        assert bootstrap["revoked_at"] is None
+    finally:
+        service.close()
+
+
+def test_concurrent_same_instance_reactivation_is_serialized_without_duplicate(
+    tmp_path
+):
+    settings = pilot.pilot_test_settings(tmp_path / "pilot")
+    clock = MutableClock()
+    setup = pilot.WorkerControlPlaneService(settings, clock=clock)
+    instance_id = str(uuid.uuid4())
+    body = _registration_body(instance_id)
+    try:
+        first = setup.provision_worker(ttl_seconds=900, single_use=True)
+        _, first_response = setup.register_worker(body, first["secret"])
+        setup.revoke_registration(
+            "server-a-worker",
+            instance_id,
+            first_response["registration_id"],
+        )
+        second = setup.provision_worker(ttl_seconds=900, single_use=True)
+    finally:
+        setup.close()
+
+    services = [
+        pilot.WorkerControlPlaneService(settings, clock=clock)
+        for _ in range(2)
+    ]
+
+    def attempt(index):
+        try:
+            return services[index].register_worker(
+                body, second["secret"]
+            )[0]
+        except WorkerControlPlaneError as exc:
+            return exc.code
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(attempt, range(2)))
+        assert sorted(map(str, results)) == ["200", "invalid_credential"]
+        rows = services[0].store.conn.execute(
+            "SELECT registration_id,status FROM worker_instances "
+            "WHERE worker_id=? AND instance_id=?",
+            ("server-a-worker", instance_id),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["registration_id"] == first_response["registration_id"]
+        assert rows[0]["status"] == "active"
+    finally:
+        for service in services:
+            service.close()
+
+
 def test_concurrent_single_use_register_allows_exactly_one_success(tmp_path):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
     setup = pilot.WorkerControlPlaneService(
