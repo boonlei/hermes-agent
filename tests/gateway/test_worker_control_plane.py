@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -19,6 +21,15 @@ from gateway.worker_control_plane.app import (
     create_worker_control_plane_app,
 )
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
+from gateway.worker_control_plane.errors import WorkerControlPlaneError
+from gateway.worker_control_plane.models import (
+    CODEX_EXECUTE_CLASSIFICATION_BY_STATUS,
+    CODEX_EXECUTE_MAX_INSTRUCTION_BYTES,
+    CODEX_EXECUTE_MAX_RESULT_BYTES,
+    validate_capabilities,
+    validate_codex_execute_payload,
+    validate_codex_execute_result,
+)
 from gateway.worker_control_plane.service import WorkerControlPlaneService
 from tests.gateway.worker_control_plane_helpers import MockWorkerClient
 
@@ -47,6 +58,106 @@ async def control_plane(tmp_path):
     await client.start_server()
     try:
         yield service, client, secret
+    finally:
+        await client.close()
+        service.close()
+
+
+def _codex_payload(**overrides):
+    payload = {
+        "path_id": "hermes-server-worker",
+        "mode": "read_only",
+        "instruction": "Inspect the repository and report findings without changes.",
+        "timeout_seconds": 60,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _codex_inner(
+    *,
+    status="completed",
+    classification="success",
+    failure_code=None,
+    summary="bounded test result",
+    exit_code=0,
+    duration_ms=0,
+    guards=None,
+    truncated=None,
+):
+    result = {
+        "status": status,
+        "classification": classification,
+        "failure_code": failure_code,
+        "summary": summary,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "guards": {"read_only": True} if guards is None else guards,
+    }
+    if truncated is not None:
+        result["truncated"] = truncated
+    return json.dumps(
+        result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+WORKER_STATUS_CLASSIFICATION = {
+    "completed": "success",
+    "failed": "execution_failure",
+    "rejected": "guard_failure",
+    "timed_out": "timeout",
+}
+
+GOLDEN_VECTOR_DIRECTORY = (
+    Path(__file__).parent
+    / "fixtures"
+    / "worker_control_plane"
+    / "codex_execute_v1"
+)
+GOLDEN_FIXTURE_NAMES = {
+    "capability_registration.json",
+    "duplicate_result.json",
+    "poll_request_invalid_extra_field.json",
+    "poll_request_valid.json",
+    "result_completed.json",
+    "result_failed.json",
+    "result_rejected.json",
+    "result_timed_out.json",
+    "result_worker_execution_failed.json",
+    "result_worker_execution_timed_out.json",
+    "result_worker_invalid_result.json",
+    "result_worker_post_guard_failed.json",
+    "result_worker_process_adapter_failed.json",
+}
+
+
+def _canonical_json_bytes(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _load_golden_fixture(name):
+    return json.loads(
+        (GOLDEN_VECTOR_DIRECTORY / name).read_text(encoding="utf-8")
+    )
+
+
+@pytest_asyncio.fixture
+async def codex_control_plane(tmp_path):
+    settings = WorkerControlPlaneSettings.for_test(
+        tmp_path / "worker-control-plane.db", approved_test_root=tmp_path
+    )
+    service = WorkerControlPlaneService(settings, clock=MutableTestClock())
+    provisioned = service.provision_worker(
+        capabilities=["system.echo", "codex.execute"]
+    )
+    app = create_worker_control_plane_app(settings, service)
+    server = TestServer(app)
+    client = TestClient(server)
+    await client.start_server()
+    try:
+        yield service, client, provisioned
     finally:
         await client.close()
         service.close()
@@ -1003,4 +1114,955 @@ async def test_ack_is_rejected_exactly_at_deadline(control_plane):
     service.advance_for_test(service.settings.ack_deadline_seconds)
     status, _ = await worker.ack(envelope["task"], key="ack-boundary-key")
     assert status == 410
+    assert service.task_state(task_id) == "queued"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("path_id", "arbitrary-local-path"),
+        ("mode", "write"),
+        ("instruction", ""),
+        ("instruction", "x" * (CODEX_EXECUTE_MAX_INSTRUCTION_BYTES + 1)),
+        ("timeout_seconds", 59),
+        ("timeout_seconds", 901),
+        ("timeout_seconds", True),
+    ),
+)
+def test_codex_execute_payload_rejects_non_allowlisted_values(
+    field, value
+):
+    with pytest.raises(ValueError, match="invalid_task_payload"):
+        validate_codex_execute_payload(_codex_payload(**{field: value}))
+
+
+def test_codex_execute_instruction_accepts_exact_8192_utf8_bytes():
+    payload = _codex_payload(
+        instruction="é" * (CODEX_EXECUTE_MAX_INSTRUCTION_BYTES // 2)
+    )
+
+    assert validate_codex_execute_payload(payload) == payload
+
+
+def test_codex_execute_instruction_accepts_exact_non_bmp_utf8_boundary():
+    payload = _codex_payload(
+        instruction="😀" * (CODEX_EXECUTE_MAX_INSTRUCTION_BYTES // 4)
+    )
+
+    assert validate_codex_execute_payload(payload) == payload
+    assert len(payload["instruction"].encode("utf-8")) == 8192
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    (
+        "\ud800",
+        "\udc00",
+        "\ud800\udc00",
+        "\udc00\ud800",
+    ),
+)
+def test_codex_execute_instruction_rejects_unicode_surrogates(instruction):
+    with pytest.raises(ValueError, match="invalid_task_payload"):
+        validate_codex_execute_payload(
+            _codex_payload(instruction=instruction)
+        )
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_instruction_surrogate_has_contract_error_class(
+    codex_control_plane
+):
+    service, _, _ = codex_control_plane
+
+    with pytest.raises(WorkerControlPlaneError) as exc:
+        service.enqueue_codex_execute(
+            _codex_payload(instruction="\ud800"),
+            "surrogate-instruction",
+        )
+
+    assert (exc.value.code, exc.value.status) == (
+        "invalid_task_payload",
+        422,
+    )
+
+
+def test_codex_execute_valid_non_bmp_result_summary_is_accepted():
+    inner = validate_codex_execute_result(_codex_inner(summary="😀"))
+
+    assert inner["summary"] == "😀"
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    (
+        "shell",
+        "command",
+        "environment",
+        "token",
+        "target",
+        "limits",
+        "task_type",
+        "max_result_bytes",
+    ),
+)
+def test_codex_execute_payload_rejects_forbidden_fields(forbidden):
+    payload = _codex_payload()
+    payload[forbidden] = "forbidden"
+
+    with pytest.raises(ValueError, match="invalid_task_payload"):
+        validate_codex_execute_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    (
+        ["codex.execute"],
+        ["codex.execute", "system.echo"],
+        ["system.echo", "codex.execute", "codex.execute"],
+    ),
+)
+def test_codex_execute_capability_requires_exact_combined_scope(capabilities):
+    with pytest.raises(ValueError, match="unsupported_capability"):
+        validate_capabilities(capabilities)
+
+    assert validate_capabilities(
+        ["system.echo", "codex.execute"]
+    ) == ["system.echo", "codex.execute"]
+
+
+def test_codex_execute_golden_fixture_manifest_is_exact_and_canonical():
+    manifest_path = GOLDEN_VECTOR_DIRECTORY / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
+
+    assert manifest_bytes == _canonical_json_bytes(manifest)
+    assert manifest["fixture_version"] == "codex.execute.v1"
+    assert manifest["status_classification"] == (
+        WORKER_STATUS_CLASSIFICATION
+    )
+    assert set(manifest["fixtures"]) == GOLDEN_FIXTURE_NAMES
+    assert {
+        path.name for path in GOLDEN_VECTOR_DIRECTORY.glob("*.json")
+    } == GOLDEN_FIXTURE_NAMES | {"manifest.json"}
+
+    for name, metadata in manifest["fixtures"].items():
+        raw = (GOLDEN_VECTOR_DIRECTORY / name).read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        assert raw == _canonical_json_bytes(value)
+        assert len(raw) == metadata["utf8_bytes"]
+        assert hashlib.sha256(raw).hexdigest() == metadata["sha256"]
+
+    payload = _load_golden_fixture("poll_request_valid.json")
+    payload_bytes = _canonical_json_bytes(payload)
+    assert validate_codex_execute_payload(payload) == payload
+    assert hashlib.sha256(payload_bytes).hexdigest() == (
+        manifest["payload_hash"]
+    )
+    assert manifest["payload_hash"] == manifest["fixtures"][
+        "poll_request_valid.json"
+    ]["sha256"]
+
+    capabilities = _load_golden_fixture("capability_registration.json")
+    assert validate_capabilities(capabilities["capabilities"]) == [
+        "system.echo",
+        "codex.execute",
+    ]
+
+    for name, expected_status in {
+        "result_completed.json": "completed",
+        "result_failed.json": "failed",
+        "result_rejected.json": "rejected",
+        "result_timed_out.json": "timed_out",
+        "result_worker_execution_failed.json": "failed",
+        "result_worker_execution_timed_out.json": "timed_out",
+        "result_worker_invalid_result.json": "failed",
+        "result_worker_post_guard_failed.json": "failed",
+        "result_worker_process_adapter_failed.json": "failed",
+    }.items():
+        result = _load_golden_fixture(name)
+        inner = validate_codex_execute_result(result["stdout"])
+        assert inner["classification"] == (
+            manifest["status_classification"][expected_status]
+        )
+        assert result["status"] == expected_status
+        assert result["stderr"] == ""
+        assert result["status"] == inner["status"]
+        assert result["exit_code"] == inner["exit_code"]
+        assert result["duration_ms"] == inner["duration_ms"]
+        assert result["payload_hash"] == manifest["payload_hash"]
+
+    completed_bytes = (
+        GOLDEN_VECTOR_DIRECTORY / "result_completed.json"
+    ).read_bytes()
+    duplicate_bytes = (
+        GOLDEN_VECTOR_DIRECTORY / "duplicate_result.json"
+    ).read_bytes()
+    assert duplicate_bytes == completed_bytes
+    assert hashlib.sha256(completed_bytes).hexdigest() == (
+        manifest["result_hash"]
+    )
+    assert manifest["result_hash"] == manifest["fixtures"][
+        "result_completed.json"
+    ]["sha256"]
+
+    invalid = _load_golden_fixture(
+        "poll_request_invalid_extra_field.json"
+    )
+    with pytest.raises(ValueError, match="invalid_task_payload"):
+        validate_codex_execute_payload(invalid)
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_status", "expected_failure_code"),
+    (
+        (
+            "result_worker_post_guard_failed.json",
+            "failed",
+            "post_guard_failed",
+        ),
+        (
+            "result_worker_process_adapter_failed.json",
+            "failed",
+            "process_adapter_failed",
+        ),
+        (
+            "result_worker_execution_timed_out.json",
+            "timed_out",
+            "execution_timed_out",
+        ),
+        (
+            "result_worker_execution_failed.json",
+            "failed",
+            "execution_failed",
+        ),
+        (
+            "result_worker_invalid_result.json",
+            "failed",
+            "invalid_result",
+        ),
+    ),
+)
+def test_codex_execute_worker_failure_vectors_are_accepted(
+    fixture_name, expected_status, expected_failure_code
+):
+    vector = _load_golden_fixture(fixture_name)
+    inner = validate_codex_execute_result(vector["stdout"])
+
+    assert vector["stderr"] == ""
+    assert vector["status"] == inner["status"] == expected_status
+    assert inner["failure_code"] == expected_failure_code
+    assert vector["exit_code"] == inner["exit_code"]
+    assert vector["duration_ms"] == inner["duration_ms"]
+
+
+def _result_for_status_classification(status, classification):
+    failure_code, exit_code = {
+        "completed": (None, 0),
+        "failed": ("codex_failed", 1),
+        "rejected": ("guard_rejected", 2),
+        "timed_out": ("timeout", 124),
+    }[status]
+    return _codex_inner(
+        status=status,
+        classification=classification,
+        failure_code=failure_code,
+        exit_code=exit_code,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "classification"),
+    tuple(WORKER_STATUS_CLASSIFICATION.items()),
+)
+def test_codex_execute_accepts_every_worker_status_classification_pair(
+    status, classification
+):
+    assert CODEX_EXECUTE_CLASSIFICATION_BY_STATUS == (
+        WORKER_STATUS_CLASSIFICATION
+    )
+
+    result = validate_codex_execute_result(
+        _result_for_status_classification(status, classification)
+    )
+
+    assert (result["status"], result["classification"]) == (
+        status,
+        classification,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "classification"),
+    tuple(
+        (status, classification)
+        for status, approved in WORKER_STATUS_CLASSIFICATION.items()
+        for classification in WORKER_STATUS_CLASSIFICATION.values()
+        if classification != approved
+    ),
+)
+def test_codex_execute_rejects_every_cross_status_classification_pair(
+    status, classification
+):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _result_for_status_classification(status, classification)
+        )
+
+
+@pytest.mark.parametrize("classification", ("unknown", None))
+def test_codex_execute_rejects_unknown_or_null_classification(
+    classification
+):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(classification=classification)
+        )
+
+
+@pytest.mark.parametrize("mutation", ("missing", "extra"))
+def test_codex_execute_classification_field_is_closed(mutation):
+    result = json.loads(_codex_inner())
+    if mutation == "missing":
+        result.pop("classification")
+    else:
+        result["classification_extra"] = "success"
+
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "failure_code"),
+    (
+        ("failed", "guard_rejected"),
+        ("rejected", "codex_failed"),
+        ("timed_out", "worker_error"),
+    ),
+)
+def test_codex_execute_failure_codes_are_status_specific(
+    status, failure_code
+):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(
+                status=status,
+                failure_code=failure_code,
+                exit_code=1,
+            )
+        )
+
+
+def test_codex_execute_unknown_failure_code_is_rejected():
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(
+                status="failed",
+                classification="execution_failure",
+                failure_code="unknown_failure",
+                exit_code=1,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "classification", "failure_code", "exit_code"),
+    (
+        ("completed", "success", "worker_error", 0),
+        ("failed", "execution_failure", None, 1),
+        ("rejected", "guard_failure", None, 1),
+        ("timed_out", "timeout", None, 124),
+    ),
+)
+def test_codex_execute_failure_code_nullability_matches_status(
+    status, classification, failure_code, exit_code
+):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(
+                status=status,
+                classification=classification,
+                failure_code=failure_code,
+                exit_code=exit_code,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "summary",
+    (
+        "\ud800",
+        "\udc00",
+        "\ud800\udc00",
+        "\udc00\ud800",
+    ),
+)
+def test_codex_execute_result_rejects_unicode_surrogates(summary):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(
+            _codex_inner(summary=summary)
+        )
+
+
+@pytest.mark.parametrize(
+    "escaped",
+    (
+        r"\ud800",
+        r"\udc00",
+        r"\ud800\udc00",
+        r"\udc00\ud800",
+    ),
+)
+def test_codex_execute_result_rejects_escaped_unicode_surrogates(escaped):
+    stdout = _codex_inner().replace(
+        "bounded test result",
+        escaped,
+    )
+
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(stdout)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    (
+        '{"status":"completed"} trailing',
+        'prefix {"status":"completed"}',
+        '{}{}',
+        '{"classification":"success","duration_ms":0,"exit_code":0,'
+        '"failure_code":null,"guards":{"read_only":true},'
+        '"status":"completed","summary":"ok","extra":true}',
+    ),
+)
+def test_codex_execute_result_requires_one_exact_closed_json_object(stdout):
+    with pytest.raises(ValueError, match="invalid_result"):
+        validate_codex_execute_result(stdout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("vector_name", "expected_task_state"),
+    (
+        ("failed", "failed"),
+        ("rejected", "rejected"),
+        ("timed_out", "failed"),
+    ),
+)
+async def test_codex_execute_noncompleted_golden_results_are_accepted(
+    codex_control_plane, vector_name, expected_task_state
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), f"golden-{vector_name}-task"
+    )
+    _, envelope = await worker.poll(f"golden-{vector_name}-poll")
+    task = envelope["task"]
+    assert (await worker.ack(
+        task, key=f"golden-{vector_name}-ack"
+    ))[0] == 200
+    vector = _load_golden_fixture(f"result_{vector_name}.json")
+
+    status, body = await worker.result(
+        task,
+        status=vector["status"],
+        stdout=vector["stdout"],
+        stderr=vector["stderr"],
+        exit_code=vector["exit_code"],
+        duration_ms=vector["duration_ms"],
+        started_at=vector["started_at"],
+        finished_at=vector["finished_at"],
+        result_key=vector["result_idempotency_key"],
+        request_key=f"golden-{vector_name}-result",
+    )
+
+    assert status == 200
+    assert body["task_state"] == expected_task_state
+    assert service.result_count(task_id) == 1
+    assert (
+        f'"safe_failure_code":'
+        f'{json.dumps(json.loads(vector["stdout"])["failure_code"])}'
+    ) in service.audit_text()
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_capability_lifecycle_and_safe_audit(
+    codex_control_plane, monkeypatch
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    capabilities = ["system.echo", "codex.execute"]
+    assert (await worker.register(capabilities=capabilities))[0] == 201
+    access_observations = []
+    original_access = service.auth.access
+
+    def access_inside_transaction(connection, token):
+        access_observations.append(connection.in_transaction)
+        return original_access(connection, token)
+
+    monkeypatch.setattr(service.auth, "access", access_inside_transaction)
+    assert (await worker.heartbeat())[0] == 200
+    payload = _codex_payload(
+        instruction="PRIVATE-INSTRUCTION-MUST-NOT-ENTER-AUDIT"
+    )
+
+    task_id = service.enqueue_codex_execute(payload, "codex-create-1")
+    assert service.enqueue_codex_execute(payload, "codex-create-1") == task_id
+    with pytest.raises(WorkerControlPlaneError) as exc:
+        service.enqueue_codex_execute(
+            _codex_payload(instruction="second"),
+            "codex-create-2",
+        )
+    assert (exc.value.code, exc.value.status) == ("state_conflict", 409)
+
+    status, body = await worker.poll(
+        "codex-unauthorized-poll", capabilities=["system.echo"]
+    )
+    assert status == 422
+    assert body["error"]["code"] == "unsupported_capability"
+
+    status, envelope = await worker.poll("codex-poll")
+    assert status == 200
+    task = envelope["task"]
+    assert task["task_id"] == task_id
+    assert task["task_type"] == "codex.execute"
+    assert task["payload_hash"] == service.store.conn.execute(
+        "SELECT payload_hash FROM worker_tasks WHERE task_id=?", (task_id,)
+    ).fetchone()["payload_hash"]
+    assert (await worker.ack(task, key="codex-ack"))[0] == 200
+    private_result = _codex_inner(
+        summary="PRIVATE-RESULT-MUST-NOT-ENTER-AUDIT",
+        duration_ms=125,
+    )
+    status, result = await worker.result(
+        task,
+        stdout=private_result,
+        duration_ms=125,
+        request_key="codex-result",
+    )
+    assert status == 200
+    assert result["task_state"] == "completed"
+    status, request_replay = await worker.result(
+        task,
+        stdout=private_result,
+        duration_ms=125,
+        request_key="codex-result",
+    )
+    assert status == 200
+    assert request_replay == result
+    status, result_replay = await worker.result(
+        task,
+        stdout=private_result,
+        duration_ms=125,
+        request_key="codex-result-retry",
+    )
+    assert status == 200
+    assert result_replay["duplicate"] is True
+    assert service.task_state(task_id) == "completed"
+    assert service.result_count(task_id) == 1
+    assert len(access_observations) >= 6
+    assert all(access_observations)
+
+    audit = service.audit_text()
+    assert "PRIVATE-INSTRUCTION-MUST-NOT-ENTER-AUDIT" not in audit
+    assert "PRIVATE-RESULT-MUST-NOT-ENTER-AUDIT" not in audit
+    assert provisioned["secret"] not in audit
+    assert worker.access_token not in audit
+    assert '"path_id":"hermes-server-worker"' in audit
+    assert '"mode":"read_only"' in audit
+    assert f'"result_size_bytes":{len(private_result.encode())}' in audit
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_result_identity_and_inner_schema_are_enforced(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), "codex-result-validation"
+    )
+    _, envelope = await worker.poll("codex-result-poll")
+    task = envelope["task"]
+    assert task["task_id"] == task_id
+    assert (await worker.ack(task, key="codex-result-ack"))[0] == 200
+
+    status, body = await worker.result(
+        task,
+        stdout="not-json",
+        request_key="codex-invalid-json",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert service.result_count(task_id) == 0
+
+    mismatched = dict(task)
+    mismatched["payload_hash"] = "0" * 64
+    status, body = await worker.result(
+        mismatched,
+        stdout=_codex_inner(),
+        request_key="codex-wrong-hash",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert service.result_count(task_id) == 0
+
+    mismatched = dict(task)
+    mismatched["trace_id"] = str(uuid.uuid4())
+    status, body = await worker.result(
+        mismatched,
+        stdout=_codex_inner(),
+        request_key="codex-wrong-trace",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert service.result_count(task_id) == 0
+
+    mismatched_inner = _codex_inner(
+        status="failed",
+        classification="execution_failure",
+        failure_code="codex_failed",
+        exit_code=1,
+        duration_ms=1,
+    )
+    status, body = await worker.result(
+        task,
+        stdout=mismatched_inner,
+        status="completed",
+        exit_code=0,
+        duration_ms=1,
+        request_key="codex-outer-inner-mismatch",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert service.result_count(task_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_http_rejects_classification_mismatch_before_write(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), "classification-http"
+    )
+    _, envelope = await worker.poll("classification-http-poll")
+    task = envelope["task"]
+    assert (await worker.ack(
+        task, key="classification-http-ack"
+    ))[0] == 200
+
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(classification="execution_failure"),
+        request_key="classification-http-result",
+    )
+
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert status != 503
+    assert service.result_count(task_id) == 0
+    assert "result_accepted" not in service.audit_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ("\ud800", "\udc00"))
+async def test_codex_execute_http_surrogate_is_invalid_result_not_503(
+    codex_control_plane, summary
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), f"surrogate-result-{ord(summary):x}"
+    )
+    _, envelope = await worker.poll(
+        f"surrogate-result-{ord(summary):x}-poll"
+    )
+    task = envelope["task"]
+    assert (await worker.ack(
+        task, key=f"surrogate-result-{ord(summary):x}-ack"
+    ))[0] == 200
+
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(summary=summary),
+        request_key=f"surrogate-result-{ord(summary):x}-submit",
+    )
+
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+    assert status != 503
+    assert service.result_count(task_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_http_accepts_valid_non_bmp_result(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(instruction="😀"), "non-bmp-result"
+    )
+    _, envelope = await worker.poll("non-bmp-result-poll")
+    task = envelope["task"]
+    assert (await worker.ack(task, key="non-bmp-result-ack"))[0] == 200
+
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(summary="😀"),
+        request_key="non-bmp-result-submit",
+    )
+
+    assert status == 200
+    assert body["task_state"] == "completed"
+    assert service.result_count(task_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_full_32k_result_contract_is_http_reachable(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), "codex-http-result-capacity"
+    )
+    _, envelope = await worker.poll("codex-http-capacity-poll")
+    task = envelope["task"]
+    assert task["task_id"] == task_id
+    assert (await worker.ack(task, key="codex-http-capacity-ack"))[0] == 200
+
+    empty_summary = _codex_inner(summary="x")
+    stdout = _codex_inner(
+        summary="x" * (
+            CODEX_EXECUTE_MAX_RESULT_BYTES
+            - len(empty_summary.encode())
+            + 1
+        )
+    )
+    assert len(stdout.encode()) == CODEX_EXECUTE_MAX_RESULT_BYTES
+    status, body = await worker.result(
+        task,
+        stdout=stdout,
+        request_key="codex-http-capacity-result",
+    )
+
+    assert status == 200
+    assert body["task_state"] == "completed"
+    assert service.result_count(task_id) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdout_size", "expected_status", "expected_results"),
+    ((4096, 200, 1), (4097, 413, 0)),
+)
+async def test_system_echo_keeps_existing_4096_byte_stdout_limit(
+    control_plane, stdout_size, expected_status, expected_results
+):
+    service, client, secret = control_plane
+    worker = MockWorkerClient(client, secret)
+    assert (await worker.register())[0] == 201
+    message = "x" * 4096 if stdout_size == 4096 else "echo-limit"
+    task_id = service.create_test_echo_task(
+        {"message": message}, f"echo-limit-{stdout_size}"
+    )
+    _, envelope = await worker.poll(f"echo-limit-{stdout_size}-poll")
+    task = envelope["task"]
+    assert (await worker.ack(
+        task, key=f"echo-limit-{stdout_size}-ack"
+    ))[0] == 200
+
+    status, _ = await worker.result(
+        task,
+        stdout="x" * stdout_size,
+        status="completed" if stdout_size == 4096 else "failed",
+        exit_code=0 if stdout_size == 4096 else 1,
+        result_key=f"echo-limit-{stdout_size}",
+        request_key=f"echo-limit-{stdout_size}-result",
+    )
+
+    assert status == expected_status
+    assert service.result_count(task_id) == expected_results
+
+
+@pytest.mark.asyncio
+async def test_transport_oversize_is_413_not_malformed_request(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(), "codex-transport-oversize"
+    )
+    _, envelope = await worker.poll("codex-transport-oversize-poll")
+    task = envelope["task"]
+    assert (await worker.ack(task, key="codex-transport-oversize-ack"))[0] == 200
+    body = worker.base() | {
+        "task_id": task_id,
+        "delivery_id": task["delivery_id"],
+        "task_type": "codex.execute",
+        "status": "completed",
+        "stdout": "x" * 300000,
+        "stderr": "",
+        "exit_code": 0,
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:00:00Z",
+        "duration_ms": 0,
+        "result_idempotency_key": "transport-oversize",
+        "payload_hash": task["payload_hash"],
+        "trace_id": task["trace_id"],
+    }
+
+    response = await client.post(
+        f"/worker/v1/tasks/{task_id}/result",
+        headers=worker.headers("codex-transport-oversize-result"),
+        json=body,
+    )
+    error_body = await response.json()
+
+    assert response.status == 413
+    assert error_body["error"]["code"] == "payload_too_large"
+    assert service.result_count(task_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_timing_stderr_and_outer_extra_field_are_strict(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(timeout_seconds=60),
+        "codex-timing-strict",
+    )
+    _, envelope = await worker.poll("codex-timing-poll")
+    task = envelope["task"]
+    assert (await worker.ack(task, key="codex-timing-ack"))[0] == 200
+
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(duration_ms=1),
+        duration_ms=1,
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T01:00:00Z",
+        request_key="codex-timing-mismatch",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(),
+        stderr="forbidden",
+        request_key="codex-stderr",
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_result"
+
+    result_body = worker.base() | {
+        "task_id": task_id,
+        "delivery_id": task["delivery_id"],
+        "task_type": "codex.execute",
+        "status": "completed",
+        "stdout": _codex_inner(),
+        "stderr": "",
+        "exit_code": 0,
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:00:00Z",
+        "duration_ms": 0,
+        "result_idempotency_key": "completed-null-failure",
+        "payload_hash": task["payload_hash"],
+        "trace_id": task["trace_id"],
+        "failure_code": "top-level-forbidden",
+    }
+    response = await client.post(
+        f"/worker/v1/tasks/{task_id}/result",
+        headers=worker.headers("codex-null-failure-code"),
+        json=result_body,
+    )
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] == "malformed_request"
+    assert service.result_count(task_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_lease_covers_declared_execution_timeout(
+    codex_control_plane
+):
+    service, client, provisioned = codex_control_plane
+    worker = MockWorkerClient(client, provisioned["secret"])
+    assert (await worker.register(
+        capabilities=["system.echo", "codex.execute"]
+    ))[0] == 201
+    task_id = service.enqueue_codex_execute(
+        _codex_payload(timeout_seconds=120),
+        "codex-long-execution",
+    )
+    _, envelope = await worker.poll("codex-long-poll")
+    task = envelope["task"]
+    assert (await worker.ack(task, key="codex-long-ack"))[0] == 200
+
+    service.advance_for_test(61)
+    status, body = await worker.result(
+        task,
+        stdout=_codex_inner(duration_ms=61000),
+        duration_ms=61000,
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:01:01Z",
+        request_key="codex-long-result",
+    )
+
+    assert status == 200
+    assert body["task_state"] == "completed"
+    assert service.result_count(task_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_echo_only_access_cannot_poll_codex_task(control_plane):
+    service, _, secret = control_plane
+    worker = MockWorkerClient(control_plane[1], secret)
+    assert (await worker.register())[0] == 201
+    task_id = service.enqueue_codex_execute(_codex_payload(), "codex-authz")
+
+    status, body = await worker.poll(
+        "codex-authz-poll", capabilities=["codex.execute"]
+    )
+
+    assert status == 422
+    assert body["error"]["code"] == "unsupported_capability"
     assert service.task_state(task_id) == "queued"

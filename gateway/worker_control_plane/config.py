@@ -82,7 +82,9 @@ class WorkerControlPlaneSettings:
     ack_deadline_seconds: int = 10
     lease_seconds: int = 60
     max_poll_wait_seconds: int = 0
-    max_body_bytes: int = 16 * 1024
+    # Bounded transport envelope for a 32 KiB decoded result, including
+    # worst-case JSON escaping and the fixed protocol metadata.
+    max_body_bytes: int = 256 * 1024
     max_stdout_bytes: int = 4096
     max_stderr_bytes: int = 4096
     max_attempts: int = 3
