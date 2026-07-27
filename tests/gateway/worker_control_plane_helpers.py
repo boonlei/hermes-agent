@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 
@@ -81,15 +82,32 @@ class MockWorkerClient:
         duration_ms=0,
         started_at="2026-01-01T00:00:00Z",
         finished_at="2026-01-01T00:00:00Z",
-        failure_code=None,
         result_key="result-1",
         request_key="request-result-1",
     ):
-        default_stdout = (
-            task["payload"]["message"]
-            if task["task_type"] == "system.echo"
-            else "HERMES-CODEX-READ-ONLY-OK"
-        )
+        if task["task_type"] == "system.echo":
+            default_stdout = task["payload"]["message"]
+        else:
+            failure_codes = {
+                "failed": "codex_failed",
+                "rejected": "guard_rejected",
+                "timed_out": "timeout",
+            }
+            default_stdout = json.dumps(
+                {
+                    "classification": (
+                        "success" if status == "completed" else status
+                    ),
+                    "duration_ms": duration_ms,
+                    "exit_code": exit_code,
+                    "failure_code": failure_codes.get(status),
+                    "guards": {"read_only": True},
+                    "status": status,
+                    "summary": "bounded test result",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         message = default_stdout if stdout is None else stdout
         data = self.base() | {"task_id": task["task_id"], "delivery_id": task["delivery_id"],
             "task_type": task["task_type"], "status": status, "stdout": message, "stderr": stderr,
@@ -98,7 +116,5 @@ class MockWorkerClient:
             "duration_ms": duration_ms, "result_idempotency_key": result_key,
             "payload_hash": task["payload_hash"],
             "trace_id": task["trace_id"]}
-        if failure_code is not None:
-            data["failure_code"] = failure_code
         response = await self.client.post(f'/worker/v1/tasks/{task["task_id"]}/result', headers=self.headers(request_key), json=data)
         return response.status, await response.json()

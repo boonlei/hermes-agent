@@ -5,20 +5,26 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
-EXPECTED_HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
-INSTRUCTION_TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-SAFE_FAILURE_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+SAFE_RESULT_IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 KNOWN_CAPABILITIES = ("system.echo", "codex.execute")
 CODEX_EXECUTE_WORKER_ID = "server-a-worker"
-CODEX_EXECUTE_HOST = "DESKTOP-87SSHTU"
-CODEX_EXECUTE_REPOSITORY = "boonlei/HermesServerWorker"
 CODEX_EXECUTE_PATH_ID = "hermes-server-worker"
-CODEX_EXECUTE_BRANCH = "main"
 CODEX_EXECUTE_MODE = "read_only"
-CODEX_EXECUTE_MAX_INSTRUCTION_BYTES = 16 * 1024
+CODEX_EXECUTE_MAX_INSTRUCTION_BYTES = 8 * 1024
 CODEX_EXECUTE_MAX_RESULT_BYTES = 32 * 1024
 CODEX_EXECUTE_RESULT_GRACE_SECONDS = 5
+CODEX_EXECUTE_FAILURE_CODES_BY_STATUS = {
+    "failed": {"codex_failed", "worker_error"},
+    "rejected": {"guard_rejected", "repository_mismatch"},
+    "timed_out": {"timeout"},
+}
+CODEX_EXECUTE_RESULT_STATUSES = {
+    "completed",
+    "failed",
+    "rejected",
+    "timed_out",
+}
 
 def canonical_json_hash(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -40,67 +46,93 @@ def validate_capabilities(value: object) -> list[str]:
     canonical = [name for name in KNOWN_CAPABILITIES if name in requested]
     if len(requested) != len(value) or value != canonical:
         raise ValueError("unsupported_capability")
+    if "codex.execute" in requested and value != list(KNOWN_CAPABILITIES):
+        raise ValueError("unsupported_capability")
     return canonical
 
 def validate_codex_execute_payload(payload: object) -> dict:
     if not isinstance(payload, dict) or set(payload) != {
-        "task_type", "target", "instruction", "limits"
-    }:
-        raise ValueError("invalid_task_payload")
-    target = payload["target"]
-    instruction = payload["instruction"]
-    limits = payload["limits"]
-    if payload["task_type"] != "codex.execute":
-        raise ValueError("invalid_task_payload")
-    if not isinstance(target, dict) or set(target) != {
-        "host", "repository", "path_id", "branch", "expected_head"
+        "path_id", "mode", "instruction", "timeout_seconds"
     }:
         raise ValueError("invalid_task_payload")
     if (
-        target["host"] != CODEX_EXECUTE_HOST
-        or target["repository"] != CODEX_EXECUTE_REPOSITORY
-        or target["path_id"] != CODEX_EXECUTE_PATH_ID
-        or target["branch"] != CODEX_EXECUTE_BRANCH
-        or not isinstance(target["expected_head"], str)
-        or not EXPECTED_HEAD_RE.fullmatch(target["expected_head"])
-    ):
-        raise ValueError("invalid_task_payload")
-    if not isinstance(instruction, dict) or set(instruction) != {
-        "task_id", "text", "mode"
-    }:
-        raise ValueError("invalid_task_payload")
-    if (
-        not isinstance(instruction["task_id"], str)
-        or not INSTRUCTION_TASK_ID_RE.fullmatch(instruction["task_id"])
-        or not isinstance(instruction["text"], str)
-        or not instruction["text"]
-        or len(instruction["text"].encode("utf-8"))
+        payload["path_id"] != CODEX_EXECUTE_PATH_ID
+        or payload["mode"] != CODEX_EXECUTE_MODE
+        or not isinstance(payload["instruction"], str)
+        or not payload["instruction"]
+        or len(payload["instruction"].encode("utf-8"))
         > CODEX_EXECUTE_MAX_INSTRUCTION_BYTES
-        or instruction["mode"] != CODEX_EXECUTE_MODE
-    ):
-        raise ValueError("invalid_task_payload")
-    if not isinstance(limits, dict) or set(limits) != {
-        "timeout_seconds", "max_result_bytes"
-    }:
-        raise ValueError("invalid_task_payload")
-    if (
-        type(limits["timeout_seconds"]) is not int
-        or not 60 <= limits["timeout_seconds"] <= 900
-        or type(limits["max_result_bytes"]) is not int
-        or not 1 <= limits["max_result_bytes"] <= CODEX_EXECUTE_MAX_RESULT_BYTES
+        or type(payload["timeout_seconds"]) is not int
+        or not 60 <= payload["timeout_seconds"] <= 900
     ):
         raise ValueError("invalid_task_payload")
     return {
-        "task_type": "codex.execute",
-        "target": dict(target),
-        "instruction": dict(instruction),
-        "limits": dict(limits),
+        "path_id": CODEX_EXECUTE_PATH_ID,
+        "mode": CODEX_EXECUTE_MODE,
+        "instruction": payload["instruction"],
+        "timeout_seconds": payload["timeout_seconds"],
     }
 
-def validate_safe_failure_code(value: object) -> str:
-    if not isinstance(value, str) or not SAFE_FAILURE_CODE_RE.fullmatch(value):
+def validate_codex_execute_result(value: object) -> dict:
+    if not isinstance(value, str) or not value:
         raise ValueError("invalid_result")
-    return value
+    try:
+        result = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("invalid_result") from None
+    if not isinstance(result, dict):
+        raise ValueError("invalid_result")
+    required = {
+        "status",
+        "classification",
+        "failure_code",
+        "summary",
+        "exit_code",
+        "duration_ms",
+        "guards",
+    }
+    if not required <= set(result) or set(result) - required - {"truncated"}:
+        raise ValueError("invalid_result")
+    if json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) != value:
+        raise ValueError("invalid_result")
+    if result["status"] not in CODEX_EXECUTE_RESULT_STATUSES:
+        raise ValueError("invalid_result")
+    if (
+        not isinstance(result["classification"], str)
+        or not SAFE_RESULT_IDENTIFIER_RE.fullmatch(result["classification"])
+        or not isinstance(result["summary"], str)
+        or not result["summary"]
+        or len(result["summary"].encode("utf-8"))
+        > CODEX_EXECUTE_MAX_RESULT_BYTES
+        or type(result["exit_code"]) is not int
+        or type(result["duration_ms"]) is not int
+        or result["duration_ms"] < 0
+        or not isinstance(result["guards"], dict)
+        or len(result["guards"]) > 32
+        or any(
+            not isinstance(name, str)
+            or not SAFE_RESULT_IDENTIFIER_RE.fullmatch(name)
+            or type(passed) is not bool
+            for name, passed in result["guards"].items()
+        )
+        or ("truncated" in result and type(result["truncated"]) is not bool)
+    ):
+        raise ValueError("invalid_result")
+    if result["status"] == "completed":
+        if result["failure_code"] is not None or result["exit_code"] != 0:
+            raise ValueError("invalid_result")
+    elif (
+        result["failure_code"]
+        not in CODEX_EXECUTE_FAILURE_CODES_BY_STATUS[result["status"]]
+        or result["exit_code"] == 0
+    ):
+        raise ValueError("invalid_result")
+    return result
 
 def require_uuid(value: object, name: str) -> str:
     if not isinstance(value, str): raise ValueError(f"invalid_{name}")

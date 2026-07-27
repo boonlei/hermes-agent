@@ -8,11 +8,12 @@ from .config import WorkerControlPlaneSettings
 from .errors import WorkerControlPlaneError, error
 from .models import (
  CODEX_EXECUTE_WORKER_ID,
+ CODEX_EXECUTE_MAX_RESULT_BYTES,
  CODEX_EXECUTE_RESULT_GRACE_SECONDS,
  canonical_json_hash,
  validate_capabilities,
  validate_codex_execute_payload,
- validate_safe_failure_code,
+ validate_codex_execute_result,
  validate_system_echo_payload,
 )
 from .storage import CURRENT_LIFECYCLE_VERSION, WorkerControlPlaneStore
@@ -151,8 +152,7 @@ class WorkerControlPlaneService:
   with self.store.transaction() as c:
    c.execute("UPDATE workers SET enabled=0,revoked_at=? WHERE worker_id='server-a-worker'",(self.now(),)); self._audit(c,'worker_revoked',worker_id='server-a-worker')
  def _codex_audit_details(self,payload,**extra):
-  target=payload['target']; instruction=payload['instruction']
-  return {'repository':target['repository'],'path_id':target['path_id'],'branch':target['branch'],'expected_head':target['expected_head'],'mode':instruction['mode'],**extra}
+  return {'path_id':payload['path_id'],'mode':payload['mode'],**extra}
  def _enqueue_task(self,task_type,payload,key,worker_id):
   if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
   if not isinstance(key,str) or not 1<=len(key)<=128 or not key.isascii() or not key.isprintable(): raise error('malformed_request')
@@ -313,7 +313,7 @@ class WorkerControlPlaneService:
    current=self._now_datetime(); attempt=task['attempt']+1; did=str(uuid.uuid4()); ack=(current+timedelta(seconds=self.settings.ack_deadline_seconds)).isoformat().replace('+00:00','Z')
    lease_seconds=self.settings.lease_seconds
    if task['task_type']=='codex.execute':
-    lease_seconds=self.settings.ack_deadline_seconds+payload['limits']['timeout_seconds']+CODEX_EXECUTE_RESULT_GRACE_SECONDS
+    lease_seconds=self.settings.ack_deadline_seconds+payload['timeout_seconds']+CODEX_EXECUTE_RESULT_GRACE_SECONDS
    lease=(current+timedelta(seconds=lease_seconds)).isoformat().replace('+00:00','Z')
    c.execute("UPDATE worker_tasks SET state='leased',attempt=?,leased_until=? WHERE task_id=?",(attempt,lease,task['task_id'])); c.execute("INSERT INTO worker_deliveries VALUES(?,?,?,?,?,?,?,?,?,?,?)",(did,task['task_id'],row['worker_id'],row['registration_id'],attempt,'leased',self.now(),ack,lease,None,None)); env={'task':{'task_id':task['task_id'],'delivery_id':did,'task_type':task['task_type'],'payload':payload,'payload_hash':task['payload_hash'],'trace_id':task['trace_id'],'attempt':attempt,'max_attempts':task['max_attempts'],'ack_deadline_at':ack,'lease_expires_at':lease}}
    details=self._codex_audit_details(payload,status='leased') if task['task_type']=='codex.execute' else None
@@ -346,7 +346,7 @@ class WorkerControlPlaneService:
   return out
  def submit_result(self,task_id,d,token,key):
   late=False; out=None
-  if d.get('task_id') != task_id or d.get('task_type') not in ('system.echo','codex.execute') or d.get('status') not in ('completed','failed','rejected','cancelled','expired'): raise error('invalid_result')
+  if d.get('task_id') != task_id or d.get('task_type') not in ('system.echo','codex.execute') or d.get('status') not in ('completed','failed','rejected','cancelled','expired','timed_out'): raise error('invalid_result')
   if not isinstance(d.get('stdout'),str) or not isinstance(d.get('stderr'),str): raise error('invalid_result')
   if type(d.get('duration_ms')) is not int or d['duration_ms']<0: raise error('invalid_result')
   try:
@@ -365,19 +365,17 @@ class WorkerControlPlaneService:
    if delivery['worker_id']!=row['worker_id'] or delivery['registration_id']!=row['registration_id']: raise error('worker_not_authorized')
    if delivery['task_type']!=d.get('task_type'): raise error('invalid_result')
    payload=json.loads(delivery['payload_json'])
-   result_size=len(d['stdout'].encode())+len(d['stderr'].encode())
+   result_size=len(d['stdout'].encode())
    if delivery['task_type']=='system.echo':
+    if d['status']=='timed_out': raise error('invalid_result')
     if len(d['stdout'].encode())>self.settings.max_stdout_bytes or len(d['stderr'].encode())>self.settings.max_stderr_bytes: raise error('payload_too_large')
-    if 'failure_code' in d: raise error('invalid_result')
    else:
-    if result_size>payload['limits']['max_result_bytes']: raise error('payload_too_large')
-    timeout_ms=payload['limits']['timeout_seconds']*1000
+    if d['stderr']!='' or result_size>CODEX_EXECUTE_MAX_RESULT_BYTES: raise error('payload_too_large' if result_size>CODEX_EXECUTE_MAX_RESULT_BYTES else 'invalid_result')
+    try: inner=validate_codex_execute_result(d['stdout'])
+    except ValueError: raise error('invalid_result') from None
+    timeout_ms=payload['timeout_seconds']*1000
     if d.get('duration_ms')>timeout_ms or elapsed_ms>timeout_ms or abs(d['duration_ms']-elapsed_ms)>1000: raise error('invalid_result')
-    if d['status']=='completed':
-     if 'failure_code' in d or d.get('exit_code')!=0: raise error('invalid_result')
-    else:
-     try: validate_safe_failure_code(d.get('failure_code'))
-     except ValueError: raise error('invalid_result') from None
+    if (d['status'],d.get('exit_code'),d['duration_ms']) != (inner['status'],inner['exit_code'],inner['duration_ms']): raise error('invalid_result')
    result_hash=canonical_json_hash(d); existing=c.execute("SELECT result_hash FROM worker_results WHERE task_id=? AND result_idempotency_key=?",(task_id,d.get('result_idempotency_key'))).fetchone()
    if existing:
     if existing['result_hash']!=result_hash: raise error('idempotency_conflict')
@@ -394,7 +392,7 @@ class WorkerControlPlaneService:
     result_id=str(uuid.uuid4())
     c.execute("INSERT INTO worker_results VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(result_id,task_id,delivery['delivery_id'],d['result_idempotency_key'],result_hash,d['status'],d['stdout'],d['stderr'],d.get('exit_code'),d['started_at'],d['finished_at'],d['duration_ms'],self.now()))
     state='completed' if d['status']=='completed' else ('rejected' if d['status']=='rejected' else 'failed')
-    details=self._codex_audit_details(payload,status=d['status'],duration_ms=d['duration_ms'],result_size_bytes=result_size,safe_failure_code=d.get('failure_code'),result_id=result_id) if delivery['task_type']=='codex.execute' else None
+    details=self._codex_audit_details(payload,status=d['status'],duration_ms=d['duration_ms'],result_size_bytes=result_size,safe_failure_code=inner['failure_code'],result_id=result_id) if delivery['task_type']=='codex.execute' else None
     c.execute("UPDATE worker_deliveries SET state='completed',finished_at=? WHERE delivery_id=?",(self.now(),delivery['delivery_id'])); c.execute("UPDATE worker_tasks SET state=?,leased_until=NULL WHERE task_id=?",(state,task_id)); out={'accepted':True,'duplicate':False,'task_state':state,'server_time':self.now()}; self._dedup_store(c,row,d,key,'POST','/worker/v1/tasks/{task_id}/result',task_id,out,200); self._audit(c,'result_accepted',worker_id=row['worker_id'],task_id=task_id,delivery_id=delivery['delivery_id'],trace_id=delivery['trace_id'],details=details)
   if late: raise error('lease_expired')
   return out

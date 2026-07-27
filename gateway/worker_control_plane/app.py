@@ -100,7 +100,7 @@ def _ack(body: dict) -> None:
 
 def _result(body: dict, route_task_id: str) -> None:
     _identity(body); require_uuid(body["delivery_id"], "delivery_id"); require_uuid(body["task_id"], "task_id"); require_uuid(body["trace_id"], "trace_id")
-    if body["task_id"] != route_task_id or body["task_type"] not in {"system.echo", "codex.execute"} or body["status"] not in {"completed", "failed", "rejected", "cancelled", "expired"}:
+    if body["task_id"] != route_task_id or body["task_type"] not in {"system.echo", "codex.execute"} or body["status"] not in {"completed", "failed", "rejected", "cancelled", "expired", "timed_out"}:
         raise error("invalid_result")
     if not isinstance(body["stdout"], str) or not isinstance(body["stderr"], str) or type(body["exit_code"]) is not int or type(body["duration_ms"]) is not int or body["duration_ms"] < 0:
         raise error("invalid_result")
@@ -243,7 +243,7 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         return web.json_response(svc.ack_delivery(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
     @audited("result_rejected")
     async def result(request: web.Request):
-        body = await _json(request, RESULT, {"failure_code"}); _result(body, request.match_info["task_id"])
+        body = await _json(request, RESULT); _result(body, request.match_info["task_id"])
         return web.json_response(svc.submit_result(request.match_info["task_id"], body, _token(request, "Bearer"), _key(request)))
     app.router.add_get(
         "/health",

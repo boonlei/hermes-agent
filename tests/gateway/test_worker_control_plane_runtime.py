@@ -96,16 +96,15 @@ def test_codex_execute_admin_path_builds_only_fixed_structured_payload(
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
     credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
     pilot.provision_local_worker(
-        settings, credential, capabilities=["codex.execute"]
+        settings,
+        credential,
+        capabilities=["system.echo", "codex.execute"],
     )
 
     task_id = pilot.enqueue_local_codex_execute(
         settings,
-        expected_head="a" * 40,
-        instruction_task_id="m3a-admin-path",
         instruction="Read only review.",
-        timeout_seconds=900,
-        max_result_bytes=32768,
+        timeout_seconds=60,
         idempotency_key="m3a-admin-idempotency",
     )
 
@@ -123,15 +122,12 @@ def test_codex_execute_admin_path_builds_only_fixed_structured_payload(
             "queued",
             "server-a-worker",
         )
-        assert payload["target"] == {
-            "host": "DESKTOP-87SSHTU",
-            "repository": "boonlei/HermesServerWorker",
+        assert payload == {
             "path_id": "hermes-server-worker",
-            "branch": "main",
-            "expected_head": "a" * 40,
+            "mode": "read_only",
+            "instruction": "Read only review.",
+            "timeout_seconds": 60,
         }
-        assert payload["instruction"]["mode"] == "read_only"
-        assert set(payload) == {"task_type", "target", "instruction", "limits"}
     finally:
         service.close()
 
@@ -142,7 +138,9 @@ def test_concurrent_codex_execute_creation_allows_only_one_active_task(
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
     credential = settings.approved_test_root / pilot.CREDENTIAL_FILE_NAME
     pilot.provision_local_worker(
-        settings, credential, capabilities=["codex.execute"]
+        settings,
+        credential,
+        capabilities=["system.echo", "codex.execute"],
     )
     start = Event()
 
@@ -151,23 +149,10 @@ def test_concurrent_codex_execute_creation_allows_only_one_active_task(
         try:
             start.wait(timeout=5)
             payload = {
-                "task_type": "codex.execute",
-                "target": {
-                    "host": "DESKTOP-87SSHTU",
-                    "repository": "boonlei/HermesServerWorker",
-                    "path_id": "hermes-server-worker",
-                    "branch": "main",
-                    "expected_head": f"{index + 1:040x}",
-                },
-                "instruction": {
-                    "task_id": f"concurrent-{index}",
-                    "text": "Read only.",
-                    "mode": "read_only",
-                },
-                "limits": {
-                    "timeout_seconds": 900,
-                    "max_result_bytes": 32768,
-                },
+                "path_id": "hermes-server-worker",
+                "mode": "read_only",
+                "instruction": f"Read only {index}.",
+                "timeout_seconds": 60,
             }
             return service.enqueue_codex_execute(
                 payload, f"concurrent-{index}"
@@ -205,7 +190,9 @@ def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
 ):
     settings = pilot.pilot_test_settings(tmp_path / "pilot")
     service = pilot.WorkerControlPlaneService(settings, clock=MutableClock())
-    provisioned = service.provision_worker(capabilities=["codex.execute"])
+    provisioned = service.provision_worker(
+        capabilities=["system.echo", "codex.execute"]
+    )
     instance_id = str(uuid.uuid4())
     _, registration = service.register_worker(
         {
@@ -214,7 +201,7 @@ def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
             "instance_id": instance_id,
             "worker_name": "transaction boundary worker",
             "worker_version": "0.1.0",
-            "capabilities": ["codex.execute"],
+            "capabilities": ["system.echo", "codex.execute"],
         },
         provisioned["secret"],
     )
@@ -224,23 +211,10 @@ def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
         "registration_id": registration["registration_id"],
     }
     payload = {
-        "task_type": "codex.execute",
-        "target": {
-            "host": "DESKTOP-87SSHTU",
-            "repository": "boonlei/HermesServerWorker",
-            "path_id": "hermes-server-worker",
-            "branch": "main",
-            "expected_head": "a" * 40,
-        },
-        "instruction": {
-            "task_id": "auth-transaction-boundary",
-            "text": "Read only.",
-            "mode": "read_only",
-        },
-        "limits": {
-            "timeout_seconds": 120,
-            "max_result_bytes": 32768,
-        },
+        "path_id": "hermes-server-worker",
+        "mode": "read_only",
+        "instruction": "Read only.",
+        "timeout_seconds": 120,
     }
     task_id = service.enqueue_codex_execute(
         payload, "auth-transaction-task"
@@ -279,7 +253,7 @@ def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
         return service.poll_one_task(
             identity
             | {
-                "capabilities": ["codex.execute"],
+                "capabilities": ["system.echo", "codex.execute"],
                 "max_tasks": 1,
                 "wait_seconds": 0,
             },

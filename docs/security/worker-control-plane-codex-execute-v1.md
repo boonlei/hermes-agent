@@ -2,217 +2,192 @@
 
 ## Status and scope
 
-This document defines the first restricted `codex.execute` capability for the
-Hermes Worker Control Plane (WCP). WCP schedules and tracks the task; it does
-not execute Codex, interpret the instruction, construct shell commands, or
-choose a filesystem path.
+This document defines the canonical cross-repository contract for the first
+restricted `codex.execute` capability. The Hermes Worker Control Plane (WCP)
+validates, assigns, and records the task through the existing
+task/delivery/ACK/Result lifecycle. It does not execute Codex, construct shell
+commands, accept a filesystem path, or select a repository.
 
-V1 is intentionally fixed to one reviewed target:
+V1 is fixed to:
 
 - worker: `server-a-worker`
-- host: `DESKTOP-87SSHTU`
-- repository: `boonlei/HermesServerWorker`
 - path identifier: `hermes-server-worker`
-- branch: `main`
 - mode: `read_only`
 
-No live task, Worker implementation, deployment, or commissioning is part of
-this change.
+No live task, Worker implementation, merge, deployment, or commissioning is
+part of this change.
 
-## Payload contract
+## Canonical Poll payload
 
-The canonical payload has exactly these fields:
+The `payload` delivered by Poll is a closed, flat JSON object:
 
 ```json
 {
-  "task_type": "codex.execute",
-  "target": {
-    "host": "DESKTOP-87SSHTU",
-    "repository": "boonlei/HermesServerWorker",
-    "path_id": "hermes-server-worker",
-    "branch": "main",
-    "expected_head": "<40-char lowercase git SHA>"
-  },
-  "instruction": {
-    "task_id": "<1-128 character bounded identifier>",
-    "text": "<1-16384 UTF-8 bytes>",
-    "mode": "read_only"
-  },
-  "limits": {
-    "timeout_seconds": 900,
-    "max_result_bytes": 32768
-  }
+  "path_id": "hermes-server-worker",
+  "mode": "read_only",
+  "instruction": "<1-8192 UTF-8 bytes>",
+  "timeout_seconds": 60
 }
 ```
 
-Validation is closed at every object boundary. Unknown fields, including
-`shell`, `command`, `environment`, `credential`, `token`, and arbitrary path
-fields, are rejected rather than ignored.
+The object has exactly four fields. Unknown fields and the former nested
+`target`, `instruction`, and `limits` objects are rejected. In particular,
+V1 has no shell, command, environment, credential, token, arbitrary path,
+expected-head, or per-task result-limit field.
 
-Additional limits:
+Validation rules:
 
-- `expected_head`: lowercase hexadecimal Git SHA, exactly 40 characters.
-- `instruction.task_id`: ASCII identifier matching
-  `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`.
-- `instruction.text`: non-empty, at most 16 KiB encoded as UTF-8.
-- `timeout_seconds`: integer from 60 through 900, excluding booleans.
-- `max_result_bytes`: integer from 1 through 32768, excluding booleans.
+- `path_id` is exactly `hermes-server-worker`.
+- `mode` is exactly `read_only`.
+- `instruction` is a non-empty string of at most 8192 UTF-8 bytes.
+- `timeout_seconds` is an integer from 60 through 900; booleans are rejected.
 
-The payload is canonicalized with sorted JSON keys, UTF-8 encoding, and compact
-separators before its SHA-256 hash is stored.
+The WCP hashes the validated object using sorted JSON keys, UTF-8, and compact
+separators. The fixed vectors in
+`tests/gateway/fixtures/worker_control_plane/codex_execute_v1_golden.json`
+define the exact Poll bytes and SHA-256 shared with the Worker repository.
 
-## Capability and assignment model
+## Capability and assignment
 
-Bootstrap and access credentials carry a closed JSON capability list.
-Registration may request only the exact capability scope authorized by the
-bootstrap credential. The issued access credential inherits that scope.
+Any bootstrap or access credential capable of leasing `codex.execute` must
+have exactly this ordered scope:
 
-Poll requires the request capability list to exactly match the access
-credential scope. A task is eligible only when:
+```json
+["system.echo", "codex.execute"]
+```
 
-- `worker_tasks.worker_id` equals the authenticated worker;
-- `worker_tasks.task_type` is in the access credential capability scope;
-- the task is queued and available.
+The existing `system.echo`-only scope remains valid for echo workers. A
+`codex.execute`-only scope, reordered scope, duplicate capability, or
+additional capability is rejected.
 
-The V1 administrative creation path assigns `codex.execute` only to
-`server-a-worker`. It does not accept a target host, repository, branch, or
-local path from the caller; those values are fixed by this contract.
+Task assignment remains fixed to `server-a-worker`. Poll requires the request
+capabilities to exactly match the access credential scope, and a task is
+eligible only when its worker and task type match that authenticated scope.
 
 ## State machine and concurrency
 
-`codex.execute` uses the existing WCP lifecycle:
+`codex.execute` uses the existing lifecycle:
 
-`queued -> leased -> running -> completed|failed|rejected`
+`queued -> leased -> running -> completed|failed|rejected|timed_out`
 
-It uses the existing delivery, ACK, lease expiry, retry, dead-letter,
-idempotency, and registration-lifecycle boundaries. There is no alternate
-execution or result endpoint.
+There is no alternate execution or result endpoint. Existing registration,
+authentication, ACK, lease, retry, deduplication, and result idempotency
+boundaries remain authoritative.
 
-Access credential, registration lifecycle, and capability authorization are
-read and verified inside the same `BEGIN IMMEDIATE` transaction as every
-Heartbeat, Poll, ACK, or Result mutation. A registration revocation cannot
-race between authentication and the protected business mutation.
+At most one `codex.execute` task may be active globally. Active means queued,
+leased, or running. Creation executes under `BEGIN IMMEDIATE`:
 
-The `codex.execute` delivery lease covers the ACK deadline, the task's
-declared `timeout_seconds`, and a fixed five-second result-submission grace.
-This prevents a valid execution longer than the legacy 60-second echo lease
-from being requeued and executed twice.
+1. resolve an existing creation idempotency key;
+2. reject reuse with a changed payload;
+3. return the existing task for an identical replay;
+4. reject a different active `codex.execute` task;
+5. insert the new assigned task and bounded audit metadata.
 
-At most one `codex.execute` task may be active globally. Active means
-`queued`, `leased`, or `running`. Creation is serialized by the existing
-`BEGIN IMMEDIATE` transaction:
+The delivery lease covers the declared execution timeout plus the existing
+ACK and fixed result-submission grace periods.
 
-1. Resolve an existing creation idempotency key.
-2. Reject a changed payload for that key.
-3. Return the existing task for an identical retry.
-4. Reject when another active `codex.execute` task exists.
-5. Insert the new assigned task and safe audit record.
+## Canonical Result contract
 
-## Result contract
+The existing Hermes Result envelope is unchanged. No top-level
+`failure_code` is added. Existing task, delivery, registration, payload-hash,
+trace, timing, status, exit-code, and idempotency checks continue to apply.
 
-The existing result envelope remains authoritative for task, delivery,
-registration, payload-hash, trace, timing, and idempotency checks.
+For `codex.execute`, outer `stderr` must be exactly the empty string. Outer
+`stdout` must contain exactly one canonical compact JSON object: no prefix,
+suffix, whitespace variation, or second JSON value is accepted. Its schema is
+closed and contains:
 
-For `codex.execute`:
+```json
+{
+  "status": "completed",
+  "classification": "success",
+  "failure_code": null,
+  "summary": "bounded summary",
+  "exit_code": 0,
+  "duration_ms": 1200,
+  "guards": {
+    "read_only": true
+  },
+  "truncated": false
+}
+```
 
-- task type, task ID, delivery ID, payload hash, and trace ID must match;
-- the delivery must be acknowledged and unexpired;
-- `stdout` plus `stderr`, encoded as UTF-8, must not exceed the task's
-  `max_result_bytes`, with an absolute ceiling of 32768 bytes;
-- `duration_ms` must be non-negative and no greater than
-  `timeout_seconds * 1000`;
-- `finished_at - started_at` must also be within the declared timeout and
-  must agree with `duration_ms` within 1000 milliseconds;
-- a completed result must omit `failure_code`;
-- a non-completed result must include a safe failure code matching
-  `[a-z][a-z0-9_]{0,63}`;
-- unknown result fields remain rejected.
+`truncated` is optional; every other field is required. Rules:
 
-The HTTP transport envelope is bounded at 256 KiB so a decoded 32 KiB result
-remains reachable even with worst-case JSON escaping. Decoded UTF-8 result
-limits remain authoritative. A transport-envelope violation returns the safe
-413 `payload_too_large` error.
+- `status` is `completed`, `failed`, `rejected`, or `timed_out`.
+- `classification` and guard names are safe bounded identifiers.
+- `guards` has at most 32 boolean entries.
+- `summary` is non-empty and bounded by the fixed stdout limit.
+- `exit_code` and `duration_ms` are integers; duration is non-negative.
+- `completed` requires `failure_code: null` and `exit_code: 0`.
+- `failed` requires a non-zero exit and `codex_failed` or `worker_error`.
+- `rejected` requires a non-zero exit and `guard_rejected` or
+  `repository_mismatch`.
+- `timed_out` requires a non-zero exit and `timeout`.
+- outer `status`, `exit_code`, and `duration_ms` exactly equal the inner
+  values.
 
-The full result is stored in the existing result table. Audit records contain
-only bounded metadata and never contain full stdout or stderr.
+Invalid JSON, a non-canonical serialization, an unknown or missing field,
+status/failure mismatch, outer/inner mismatch, non-empty stderr, or oversized
+stdout is rejected without storing a result.
+
+The fixed `codex.execute` stdout ceiling is 32768 UTF-8 bytes. It is not
+task-configurable. Existing `system.echo` combined stdout/stderr semantics and
+its 4096-byte ceiling are unchanged.
 
 ## Audit contract
 
-Permitted `codex.execute` audit metadata:
+The full bounded stdout is stored only in the existing business Result row.
+Audit records contain a reduced projection:
 
 - task, delivery, result, worker, registration, and trace IDs;
-- repository, path identifier, branch, and expected head;
-- mode and final status;
-- duration in milliseconds;
-- bounded result size in bytes;
-- safe failure code.
+- path identifier and mode;
+- status, duration, bounded result size, and safe failure code.
 
-Audit records must not contain:
-
-- bootstrap secrets, access tokens, or Authorization headers;
-- credential hashes, salts, or environment variables;
-- the full Codex instruction;
-- full stdout or stderr;
-- the full task payload.
+Audit records never contain the instruction, stdout, stderr, payload, secrets,
+tokens, Authorization headers, credential hashes, or environment variables.
 
 ## Threat model
 
-### Assets
-
-- Worker access and bootstrap credentials.
-- Repository identity and expected Git revision.
-- The read-only instruction and its bounded result.
-- Task/delivery/result integrity and idempotency state.
-- Registration lifecycle and capability authorization.
-
-### Trust boundaries
-
-1. An administrator creates a structured task through the local pilot CLI or
-   service boundary.
-2. WCP persists the validated payload and assigns it to an authorized worker.
-3. An authenticated Worker polls, ACKs, and submits a result.
-4. Audit consumers read a deliberately reduced metadata projection.
-
-The instruction text is untrusted data. It is not a workflow directive for
-WCP and must never become a shell command, environment mutation, filesystem
-path, SQL fragment, or audit message.
-
-### Threats and controls
-
 | Threat | Control |
 | --- | --- |
-| Target substitution | Exact host/repository/path-id/branch allowlist and lowercase SHA validation |
-| Write-capable instruction mode | Only literal `read_only` is accepted |
-| Smuggled shell, environment, token, or path fields | Closed schemas at all nesting levels |
-| Unauthorized worker leases task | Worker assignment plus credential-scoped capability equality |
-| Capability escalation after registration | Access credential stores immutable lifecycle capability scope |
-| Concurrent duplicate execution | One-active transaction guard and delivery uniqueness |
-| Idempotency-key reuse with changed payload | Canonical request hash comparison and conflict rejection |
-| Task or delivery substitution in result | Existing task/delivery/registration/hash/trace checks |
-| Oversized instruction or result | UTF-8 byte limits before persistence |
-| Timeout evasion | Result duration bounded by task timeout |
-| Audit exfiltration | Explicit safe metadata projection; no instruction or result bodies |
-| Stale registration lifecycle replay | Existing credential-scoped dedup and delivery invalidation |
-| SQL or filesystem injection | Parameterized SQL; payload contains no filesystem path |
+| Arbitrary target or local path | Only the fixed `path_id`; no caller-provided path, host, repo, or branch |
+| Write-capable execution | Only literal `read_only` is accepted |
+| Shell/environment/credential smuggling | Flat closed schema rejects all extra fields |
+| Capability escalation | Exact ordered `["system.echo","codex.execute"]` scope |
+| Concurrent duplicate execution | Transactional single-active guard and delivery uniqueness |
+| Creation replay with changed payload | Canonical payload hash and idempotency conflict |
+| Result substitution | Existing task/delivery/registration/hash/trace verification |
+| Ambiguous or forged Result | One canonical inner JSON object plus exact outer/inner matching |
+| Oversized instruction or output | UTF-8 byte limits before persistence |
+| Status/failure confusion | Status-specific failure-code allowlists |
+| Audit exfiltration | Explicit metadata projection; no instruction or result body |
 
-### Residual risks
+Residual risk: the WCP contract cannot by itself prove that the future Worker
+enforces host-side read-only execution. That requires a separately reviewed
+Worker implementation and deployment controls.
 
-- V1 cannot prove that a future Worker actually enforced read-only execution;
-  that requires a separately reviewed Worker implementation and host controls.
-- Result text is persisted as business data and may contain sensitive material
-  produced by the Worker. It is bounded and excluded from audit, but retention
-  and operator access remain deployment concerns.
-- Fixed allowlists must be changed through reviewed source changes; there is no
-  runtime override in V1.
+## Shared golden vectors
+
+The stable fixture contains:
+
+- canonical Poll payload bytes and exact SHA-256;
+- the exact combined capability registration scope;
+- completed, failed, rejected, and timed-out Result envelopes;
+- a closed-schema invalid-extra-field case;
+- a duplicate Result replay expectation.
+
+The Worker repository must copy this JSON file byte-for-byte and verify its
+file SHA-256 during the second cross-repository review.
 
 ## Verification requirements
 
-- Fresh and migrated SQLite schemas preserve existing `system.echo` data.
-- Existing lifecycle migration timestamps remain unchanged.
-- All allowlist, size, type, and closed-schema rejection cases execute real
-  validators.
-- Concurrent creation produces one active task.
-- Unauthorized capabilities cannot lease a task.
-- Result matching, size, timeout, idempotency, and audit redaction are tested
-  through the real in-process HTTP/service path.
-- Existing `system.echo` tests remain unchanged in behavior.
+- Payload allowlist, UTF-8 limits, type checks, and closed-schema failures.
+- Fixed 32768-byte `codex.execute` stdout limit and unchanged 4096-byte echo
+  behavior.
+- Canonical inner JSON, status-specific failures, and exact outer matching.
+- Concurrent single-active enforcement and duplicate idempotency behavior.
+- Unauthorized capability rejection.
+- Safe audit projection with no instruction or result content.
+- Golden vectors loaded and validated by the component tests.
+- Existing migrations and `system.echo` tests remain green.
