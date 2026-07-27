@@ -100,12 +100,34 @@ def _codex_inner(
     )
 
 
-GOLDEN_VECTOR_PATH = (
+GOLDEN_VECTOR_DIRECTORY = (
     Path(__file__).parent
     / "fixtures"
     / "worker_control_plane"
-    / "codex_execute_v1_golden.json"
+    / "codex_execute_v1"
 )
+GOLDEN_FIXTURE_NAMES = {
+    "capability_registration.json",
+    "duplicate_result.json",
+    "poll_request_invalid_extra_field.json",
+    "poll_request_valid.json",
+    "result_completed.json",
+    "result_failed.json",
+    "result_rejected.json",
+    "result_timed_out.json",
+}
+
+
+def _canonical_json_bytes(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _load_golden_fixture(name):
+    return json.loads(
+        (GOLDEN_VECTOR_DIRECTORY / name).read_text(encoding="utf-8")
+    )
 
 
 @pytest_asyncio.fixture
@@ -1147,47 +1169,76 @@ def test_codex_execute_capability_requires_exact_combined_scope(capabilities):
     ) == ["system.echo", "codex.execute"]
 
 
-def test_codex_execute_golden_vectors_are_canonical_and_shared():
-    vectors = json.loads(GOLDEN_VECTOR_PATH.read_text(encoding="utf-8"))
-    payload = vectors["poll_payload"]
-    compact = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+def test_codex_execute_golden_fixture_manifest_is_exact_and_canonical():
+    manifest_path = GOLDEN_VECTOR_DIRECTORY / "manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes.decode("utf-8"))
 
-    assert vectors["contract"] == "codex.execute.v1"
-    assert vectors["capability_registration"] == [
+    assert manifest_bytes == _canonical_json_bytes(manifest)
+    assert manifest["fixture_version"] == "codex.execute.v1"
+    assert set(manifest["fixtures"]) == GOLDEN_FIXTURE_NAMES
+    assert {
+        path.name for path in GOLDEN_VECTOR_DIRECTORY.glob("*.json")
+    } == GOLDEN_FIXTURE_NAMES | {"manifest.json"}
+
+    for name, metadata in manifest["fixtures"].items():
+        raw = (GOLDEN_VECTOR_DIRECTORY / name).read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        assert raw == _canonical_json_bytes(value)
+        assert len(raw) == metadata["utf8_bytes"]
+        assert hashlib.sha256(raw).hexdigest() == metadata["sha256"]
+
+    payload = _load_golden_fixture("poll_request_valid.json")
+    payload_bytes = _canonical_json_bytes(payload)
+    assert validate_codex_execute_payload(payload) == payload
+    assert hashlib.sha256(payload_bytes).hexdigest() == (
+        manifest["payload_hash"]
+    )
+    assert manifest["payload_hash"] == manifest["fixtures"][
+        "poll_request_valid.json"
+    ]["sha256"]
+
+    capabilities = _load_golden_fixture("capability_registration.json")
+    assert validate_capabilities(capabilities["capabilities"]) == [
         "system.echo",
         "codex.execute",
     ]
-    assert compact == vectors["poll_payload_compact"]
-    assert hashlib.sha256(compact.encode("utf-8")).hexdigest() == (
-        vectors["poll_payload_sha256"]
-    )
-    assert validate_codex_execute_payload(payload) == payload
 
-    for expected_status, result in vectors["result_vectors"].items():
+    for name, expected_status in {
+        "result_completed.json": "completed",
+        "result_failed.json": "failed",
+        "result_rejected.json": "rejected",
+        "result_timed_out.json": "timed_out",
+    }.items():
+        result = _load_golden_fixture(name)
         inner = validate_codex_execute_result(result["stdout"])
-        assert result["status"] == {
-            "success": "completed",
-            "failed": "failed",
-            "rejected": "rejected",
-            "timed_out": "timed_out",
-        }[expected_status]
+        assert result["status"] == expected_status
         assert result["stderr"] == ""
         assert result["status"] == inner["status"]
         assert result["exit_code"] == inner["exit_code"]
         assert result["duration_ms"] == inner["duration_ms"]
-        assert result["payload_hash"] == vectors["poll_payload_sha256"]
+        assert result["payload_hash"] == manifest["payload_hash"]
 
-    with pytest.raises(ValueError, match="invalid_task_payload"):
-        validate_codex_execute_payload(vectors["invalid_extra_field"])
-    replay = vectors["duplicate_replay"]
-    assert replay["result_idempotency_key"] == (
-        vectors["result_vectors"][replay["vector"]][
-            "result_idempotency_key"
-        ]
+    completed_bytes = (
+        GOLDEN_VECTOR_DIRECTORY / "result_completed.json"
+    ).read_bytes()
+    duplicate_bytes = (
+        GOLDEN_VECTOR_DIRECTORY / "duplicate_result.json"
+    ).read_bytes()
+    assert duplicate_bytes == completed_bytes
+    assert hashlib.sha256(completed_bytes).hexdigest() == (
+        manifest["result_hash"]
     )
-    assert replay["expected_duplicate"] is True
+    assert manifest["result_hash"] == manifest["fixtures"][
+        "result_completed.json"
+    ]["sha256"]
+
+    invalid = _load_golden_fixture(
+        "poll_request_invalid_extra_field.json"
+    )
+    with pytest.raises(ValueError, match="invalid_task_payload"):
+        validate_codex_execute_payload(invalid)
 
 
 @pytest.mark.parametrize(
@@ -1252,9 +1303,7 @@ async def test_codex_execute_noncompleted_golden_results_are_accepted(
     assert (await worker.ack(
         task, key=f"golden-{vector_name}-ack"
     ))[0] == 200
-    vector = json.loads(
-        GOLDEN_VECTOR_PATH.read_text(encoding="utf-8")
-    )["result_vectors"][vector_name]
+    vector = _load_golden_fixture(f"result_{vector_name}.json")
 
     status, body = await worker.result(
         task,

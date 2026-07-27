@@ -44,8 +44,9 @@ Validation rules:
 
 The WCP hashes the validated object using sorted JSON keys, UTF-8, and compact
 separators. The fixed vectors in
-`tests/gateway/fixtures/worker_control_plane/codex_execute_v1_golden.json`
-define the exact Poll bytes and SHA-256 shared with the Worker repository.
+`tests/gateway/fixtures/worker_control_plane/codex_execute_v1/` define the
+exact Poll and Result bytes shared with the Worker repository; `manifest.json`
+records every fixture SHA-256 and UTF-8 byte count.
 
 ## Capability and assignment
 
