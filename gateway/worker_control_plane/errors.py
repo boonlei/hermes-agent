@@ -21,6 +21,8 @@ ERRORS = {
  "lease_expired": (410, "Lease expired"), "payload_too_large": (413, "Payload too large"),
  "unsupported_protocol": (422, "Unsupported protocol"), "unsupported_capability": (422, "Unsupported capability"),
  "invalid_task_payload": (422, "Invalid task payload"), "invalid_result": (422, "Invalid result"),
+ "invalid_target_identity": (422, "Invalid target identity"),
+ "rate_limited": (429, "Recovery rate limit exceeded"),
 }
 def error(code: str, *, status: int | None = None, message: str | None = None) -> WorkerControlPlaneError:
     default_status, default_message = ERRORS.get(code, (400, "Malformed request"))

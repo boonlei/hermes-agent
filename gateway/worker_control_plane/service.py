@@ -1,8 +1,9 @@
 """Small transactional domain service for allowlisted Worker capabilities."""
 from __future__ import annotations
-import json, secrets, uuid
+import json, os, secrets, uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from cryptography.exceptions import InvalidTag
 from .auth import bootstrap_record, verify_bootstrap, new_access_token, verify_access_token
 from .config import WorkerControlPlaneSettings
 from .errors import WorkerControlPlaneError, error
@@ -15,6 +16,17 @@ from .models import (
  validate_codex_execute_payload,
  validate_codex_execute_result,
  validate_system_echo_payload,
+)
+from .registration_v2 import (
+ CAPABILITIES as REGISTRATION_V2_CAPABILITIES,
+ MAX_RECOVERIES,
+ PENDING_STATE,
+ WrappedToken,
+ identity_aad,
+ request_hash,
+ unwrap_token,
+ verify_installation_proof,
+ wrap_token,
 )
 from .storage import CURRENT_LIFECYCLE_VERSION, WorkerControlPlaneStore
 
@@ -59,6 +71,7 @@ class WorkerControlPlaneService:
  def __init__(self, settings, *, clock: Callable[[], datetime] | None = None):
   if not settings.enabled or settings.test_mode == settings.pilot_mode: raise ValueError('isolated mode required')
   self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._clock=clock or (lambda: datetime.now(timezone.utc)); self.auth=WorkerAuthService(self.store,self.now,self._now_datetime)
+  self.reap_expired_registration_v2()
  def _now_datetime(self):
   value=self._clock()
   if not isinstance(value,datetime) or value.tzinfo is None: raise RuntimeError('clock must return timezone-aware datetime')
@@ -68,7 +81,9 @@ class WorkerControlPlaneService:
   advance=getattr(self._clock,'advance',None)
   if advance is None: raise RuntimeError('test clock was not injected')
   advance(seconds)
- def check_health(self): self.store.check_health()
+ def check_health(self):
+  self.reap_expired_registration_v2()
+  self.store.check_health()
  def close(self): self.store.close()
  def _audit(self,c,event,**fields):
   safe={k:v for k,v in fields.items() if k in {'worker_id','instance_id','registration_id','task_id','delivery_id','trace_id','outcome','reason_code'}}
@@ -130,8 +145,53 @@ class WorkerControlPlaneService:
    row=c.execute("SELECT credential_id FROM worker_credentials WHERE worker_id=? AND credential_id=? AND kind='bootstrap' AND revoked_at IS NULL",(worker_id,credential_id)).fetchone()
    if not row: raise ValueError('credential target not found or already revoked')
    revoked_at=self.now()
+   pending=c.execute(
+    "SELECT * FROM worker_registration_transactions_v2 "
+    "WHERE worker_id=? AND bootstrap_credential_id=? AND state=?",
+    (worker_id,credential_id,PENDING_STATE),
+   ).fetchall()
    changed=c.execute("UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND credential_id=? AND kind='bootstrap' AND revoked_at IS NULL",(revoked_at,worker_id,credential_id)).rowcount
    if changed!=1: raise ValueError('credential target changed during revocation')
+   for transaction in pending:
+    c.execute(
+     "UPDATE worker_registration_transactions_v2 SET state='revoked',"
+     "revoked_at=?,escrow_salt=NULL,escrow_nonce=NULL,"
+     "escrow_ciphertext=NULL WHERE registration_transaction_id=? "
+     "AND state=?",
+     (
+      revoked_at,transaction['registration_transaction_id'],
+      PENDING_STATE,
+     ),
+    )
+    c.execute(
+     "UPDATE worker_credentials SET revoked_at=? WHERE credential_id=? "
+     "AND revoked_at IS NULL",
+     (revoked_at,transaction['credential_id']),
+    )
+    c.execute(
+     "UPDATE worker_instances SET status='revoked' "
+     "WHERE registration_id=? AND access_credential_id=? AND status=?",
+     (
+      transaction['registration_id'],transaction['credential_id'],
+      PENDING_STATE,
+     ),
+    )
+    self._audit(
+     c,
+     'registration_v2_revoked',
+     worker_id=worker_id,
+     instance_id=transaction['instance_id'],
+     registration_id=transaction['registration_id'],
+     outcome='revoked',
+     reason_code='bootstrap_credential_revoked',
+     details={
+      'registration_transaction_id':transaction[
+       'registration_transaction_id'
+      ],
+      'credential_id':transaction['credential_id'],
+      'state':'revoked',
+     },
+    )
    self._audit(c,'bootstrap_credential_revoked',worker_id=worker_id,reason_code=credential_id)
   return {'credential_id':credential_id,'worker_id':worker_id,'revoked_at':revoked_at,'state':'revoked'}
  def list_registrations(self,worker_id):
@@ -145,6 +205,35 @@ class WorkerControlPlaneService:
    changed=c.execute("UPDATE worker_instances SET status='revoked' WHERE worker_id=? AND instance_id=? AND registration_id=? AND status='active'",(worker_id,instance_id,registration_id)).rowcount
    if changed!=1: raise ValueError('registration target changed during revocation')
    c.execute("UPDATE worker_credentials SET revoked_at=? WHERE credential_id=? AND revoked_at IS NULL",(revoked_at,row['access_credential_id']))
+   transaction=c.execute(
+    "SELECT registration_transaction_id,credential_id "
+    "FROM worker_registration_transactions_v2 "
+    "WHERE registration_id=? AND credential_id=? AND state='confirmed'",
+    (registration_id,row['access_credential_id']),
+   ).fetchone()
+   if transaction:
+    c.execute(
+     "UPDATE worker_registration_transactions_v2 SET state='revoked',"
+     "revoked_at=?,escrow_salt=NULL,escrow_nonce=NULL,"
+     "escrow_ciphertext=NULL WHERE registration_transaction_id=?",
+     (revoked_at,transaction['registration_transaction_id']),
+    )
+    self._audit(
+     c,
+     'registration_v2_revoked',
+     worker_id=worker_id,
+     instance_id=instance_id,
+     registration_id=registration_id,
+     outcome='revoked',
+     reason_code='registration_revoked',
+     details={
+      'registration_transaction_id':transaction[
+       'registration_transaction_id'
+      ],
+      'credential_id':transaction['credential_id'],
+      'state':'revoked',
+     },
+    )
    self._invalidate_registration_deliveries(c,registration_id)
    self._audit(c,'registration_revoked',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id)
   return {'worker_id':worker_id,'instance_id':instance_id,'registration_id':registration_id,'status':'revoked','revoked_at':revoked_at}
@@ -206,6 +295,8 @@ class WorkerControlPlaneService:
    if d.get('worker_id')!='server-a-worker': raise error('invalid_credential')
    try: requested_capabilities=validate_capabilities(d.get('capabilities'))
    except ValueError: raise error('unsupported_capability') from None
+   if requested_capabilities!=['system.echo']:
+    raise error('unsupported_protocol')
    try: uuid.UUID(iid)
    except Exception: raise error('malformed_request')
    with self.store.transaction() as c:
@@ -252,6 +343,539 @@ class WorkerControlPlaneService:
   except Exception:
    exc=WorkerControlPlaneError('internal_error',503,True,'Temporarily unavailable',request_id=request_id,safe_context={'worker_id':worker_id,'instance_id':iid,'credential_id':credential_id,'registration_id':registration_id,'registration_lifecycle_outcome':'transaction_rolled_back'})
    raise exc from None
+ def _registration_v2_target(self,row):
+  return {
+   'path_digest':row['path_digest'],
+   'remote':row['remote'],
+   'branch':row['branch'],
+   'approved_head':row['approved_head'],
+  }
+ def _registration_v2_aad(self,row):
+  return identity_aad(
+   transaction_id=row['registration_transaction_id'],
+   registration_id=row['registration_id'],
+   credential_id=row['credential_id'],
+   worker_id=row['worker_id'],
+   instance_id=row['instance_id'],
+   host=row['host'],
+   path_id=row['path_id'],
+   target_identity=self._registration_v2_target(row),
+   capabilities=json.loads(row['capabilities_json']),
+   issued_at=row['issued_at'],
+   expires_at=row['expires_at'],
+  )
+ def _registration_v2_response(self,row,token):
+  return {
+   'protocol_version':2,
+   'registration_id':row['registration_id'],
+   'credential_id':row['credential_id'],
+   'registration_transaction_id':row['registration_transaction_id'],
+   'issued_at':row['issued_at'],
+   'expires_at':row['expires_at'],
+   'capabilities':json.loads(row['capabilities_json']),
+   'host':row['host'],
+   'path_id':row['path_id'],
+   'target_identity':self._registration_v2_target(row),
+   'access_token':token,
+   'state':row['state'],
+  }
+ def _registration_v2_identity_matches(self,row,d):
+  target=d['target_identity']
+  return (
+   row['protocol_version']==d['protocol_version']
+   and row['worker_id']==d['worker_id']
+   and row['instance_id']==d['instance_id']
+   and (
+    'registration_id' not in d
+    or row['registration_id']==d['registration_id']
+   )
+   and row['host']==d['host']
+   and row['path_id']==d['path_id']
+   and row['path_digest']==target['path_digest']
+   and row['remote']==target['remote']
+   and row['branch']==target['branch']
+   and row['approved_head']==target['approved_head']
+  )
+ def _expire_registration_v2(self,c,row):
+  now=self.now()
+  c.execute(
+   "UPDATE worker_registration_transactions_v2 SET "
+   "state='expired',escrow_salt=NULL,escrow_nonce=NULL,"
+   "escrow_ciphertext=NULL WHERE registration_transaction_id=? "
+   "AND state=?",
+   (row['registration_transaction_id'],PENDING_STATE),
+  )
+  c.execute(
+   "UPDATE worker_credentials SET revoked_at=? WHERE credential_id=? "
+   "AND revoked_at IS NULL",
+   (now,row['credential_id']),
+  )
+  c.execute(
+   "UPDATE worker_instances SET status='expired' WHERE registration_id=? "
+   "AND access_credential_id=? AND status=?",
+   (row['registration_id'],row['credential_id'],PENDING_STATE),
+  )
+  self._audit(
+   c,
+   'registration_v2_expired',
+   worker_id=row['worker_id'],
+   instance_id=row['instance_id'],
+   registration_id=row['registration_id'],
+   outcome='expired',
+   reason_code='registration_expired',
+   details={
+    'registration_transaction_id':row['registration_transaction_id'],
+    'credential_id':row['credential_id'],
+    'state':'expired',
+   },
+  )
+ def reap_expired_registration_v2(self):
+  with self.store.transaction() as c:
+   rows=c.execute(
+    "SELECT * FROM worker_registration_transactions_v2 "
+    "WHERE state=? AND expires_at<=?",
+    (PENDING_STATE,self.now()),
+   ).fetchall()
+   for row in rows:
+    self._expire_registration_v2(c,row)
+  return len(rows)
+ def _recover_registration_v2_token(self,row,secret):
+  try:
+   return unwrap_token(
+    secret,
+    WrappedToken(
+     row['escrow_salt'],
+     row['escrow_nonce'],
+     row['escrow_ciphertext'],
+    ),
+    self._registration_v2_aad(row),
+   )
+  except (InvalidTag, TypeError, ValueError, UnicodeError):
+   raise error('invalid_credential') from None
+ def register_worker_v2(self,d,secret,*,request_id=None,evidence=None):
+  request_id=request_id or str(uuid.uuid4())
+  failure=None
+  response=None
+  audit_id=None
+  replayed=False
+  with self.store.transaction() as c:
+   bootstrap=self.auth.bootstrap(c,d['worker_id'],secret)
+   try:
+    bootstrap_capabilities=validate_capabilities(
+     json.loads(bootstrap['capabilities_json'])
+    )
+    allowed_capabilities=validate_capabilities(
+     json.loads(bootstrap['allowed_capabilities'])
+    )
+   except (TypeError,ValueError,json.JSONDecodeError):
+    raise error('invalid_credential') from None
+   if (
+    bootstrap_capabilities!=REGISTRATION_V2_CAPABILITIES
+    or allowed_capabilities!=REGISTRATION_V2_CAPABILITIES
+   ):
+    raise error('unsupported_capability')
+   transaction=c.execute(
+    "SELECT * FROM worker_registration_transactions_v2 "
+    "WHERE registration_transaction_id=?",
+    (d['registration_transaction_id'],),
+   ).fetchone()
+   if transaction is not None:
+    replayed=True
+    if (
+     transaction['bootstrap_credential_id']!=bootstrap['credential_id']
+     or transaction['request_hash']!=request_hash(d)
+    ):
+     raise error('idempotency_conflict')
+    if transaction['state']!=PENDING_STATE:
+     raise error('state_conflict')
+    if transaction['expires_at']<=self.now():
+     self._expire_registration_v2(c,transaction)
+     failure=error('registration_expired')
+    elif transaction['recovery_count']>=MAX_RECOVERIES:
+     failure=error('rate_limited')
+    else:
+     token=self._recover_registration_v2_token(transaction,secret)
+     c.execute(
+      "UPDATE worker_registration_transactions_v2 SET "
+      "recovery_count=recovery_count+1,last_recovered_at=? "
+      "WHERE registration_transaction_id=?",
+      (self.now(),d['registration_transaction_id']),
+     )
+     response=self._registration_v2_response(transaction,token)
+     audit_id=self._audit(
+      c,
+      'registration_v2_replayed',
+      worker_id=d['worker_id'],
+      instance_id=d['instance_id'],
+      registration_id=transaction['registration_id'],
+      details={
+       'request_id':request_id,
+       'registration_transaction_id':d[
+        'registration_transaction_id'
+       ],
+       'credential_id':transaction['credential_id'],
+       'state':PENDING_STATE,
+      },
+     )
+   else:
+    expired_pending=c.execute(
+     "SELECT * FROM worker_registration_transactions_v2 "
+     "WHERE worker_id=? AND state=? AND expires_at<=?",
+     (d['worker_id'],PENDING_STATE,self.now()),
+    ).fetchall()
+    for expired in expired_pending:
+     self._expire_registration_v2(c,expired)
+    active=c.execute(
+     "SELECT * FROM worker_instances WHERE worker_id=? AND status='active'",
+     (d['worker_id'],),
+    ).fetchone()
+    existing=c.execute(
+     "SELECT * FROM worker_instances WHERE worker_id=? AND instance_id=?",
+     (d['worker_id'],d['instance_id']),
+    ).fetchone()
+    if active and active['instance_id']!=d['instance_id']:
+     raise error('duplicate_active_instance')
+    if existing and existing['current_task_id'] is not None:
+     raise error('instance_conflict')
+    if existing and c.execute(
+     "SELECT 1 FROM worker_deliveries WHERE registration_id=? "
+     "AND state IN ('leased','acknowledged')",
+     (existing['registration_id'],),
+    ).fetchone():
+     raise error('state_conflict')
+    if c.execute(
+     "SELECT 1 FROM worker_registration_transactions_v2 "
+     "WHERE worker_id=? AND state=?",
+     (d['worker_id'],PENDING_STATE),
+    ).fetchone():
+     raise error('state_conflict')
+    token,token_digest=new_access_token()
+    credential_id=str(uuid.uuid4())
+    registration_id=(
+     existing['registration_id'] if existing else str(uuid.uuid4())
+    )
+    issued_at=self.now()
+    expires_at=(
+     self._now_datetime()
+     + timedelta(seconds=self.settings.token_ttl_seconds)
+    ).isoformat().replace('+00:00','Z')
+    capabilities_json=json.dumps(
+     REGISTRATION_V2_CAPABILITIES,separators=(',',':')
+    )
+    c.execute(
+     "INSERT INTO worker_credentials("
+     "credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,"
+     "revoked_at,single_use,consumed_at,lifecycle_version,"
+     "capabilities_json) VALUES(?,?,?,?,?,?,?,?,0,NULL,?,?)",
+     (
+      credential_id,d['worker_id'],'access',token_digest,None,issued_at,
+      expires_at,None,CURRENT_LIFECYCLE_VERSION,capabilities_json,
+     ),
+    )
+    if not existing:
+     c.execute(
+      "INSERT INTO worker_instances VALUES(?,?,?,?,?,?,?,?,?,?)",
+      (
+       registration_id,d['worker_id'],d['instance_id'],PENDING_STATE,
+       d['worker_version'],d['protocol_version'],issued_at,issued_at,
+       credential_id,None,
+      ),
+     )
+    target=d['target_identity']
+    provisional={
+     'registration_transaction_id':d['registration_transaction_id'],
+     'registration_id':registration_id,
+     'credential_id':credential_id,
+     'worker_id':d['worker_id'],
+     'instance_id':d['instance_id'],
+     'host':d['host'],
+     'path_id':d['path_id'],
+     'path_digest':target['path_digest'],
+     'remote':target['remote'],
+     'branch':target['branch'],
+     'approved_head':target['approved_head'],
+     'capabilities_json':capabilities_json,
+     'issued_at':issued_at,
+     'expires_at':expires_at,
+    }
+    wrapped=wrap_token(
+     secret,
+     token,
+     self._registration_v2_aad(provisional),
+     random_bytes=os.urandom,
+    )
+    c.execute(
+     "INSERT INTO worker_registration_transactions_v2("
+     "registration_transaction_id,protocol_version,worker_id,instance_id,"
+     "worker_name,worker_version,registration_id,"
+     "bootstrap_credential_id,credential_id,request_hash,host,path_id,"
+     "path_digest,remote,branch,approved_head,capabilities_json,state,"
+     "issued_at,expires_at,confirmed_at,superseded_at,revoked_at,"
+     "escrow_salt,escrow_nonce,escrow_ciphertext,recovery_count,"
+     "last_recovered_at) VALUES("
+     "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,0,NULL)",
+     (
+      d['registration_transaction_id'],d['protocol_version'],d['worker_id'],
+      d['instance_id'],d['worker_name'],d['worker_version'],
+      registration_id,bootstrap['credential_id'],credential_id,
+      request_hash(d),d['host'],d['path_id'],target['path_digest'],
+      target['remote'],target['branch'],target['approved_head'],
+      capabilities_json,PENDING_STATE,issued_at,expires_at,
+      wrapped.salt,wrapped.nonce,wrapped.ciphertext,
+     ),
+    )
+    transaction=c.execute(
+     "SELECT * FROM worker_registration_transactions_v2 "
+     "WHERE registration_transaction_id=?",
+     (d['registration_transaction_id'],),
+    ).fetchone()
+    response=self._registration_v2_response(transaction,token)
+    audit_id=self._audit(
+     c,
+     'registration_v2_issued',
+     worker_id=d['worker_id'],
+     instance_id=d['instance_id'],
+     registration_id=registration_id,
+     details={
+      'request_id':request_id,
+      'registration_transaction_id':d['registration_transaction_id'],
+      'credential_id':credential_id,
+      'host':d['host'],
+      'path_id':d['path_id'],
+      'state':PENDING_STATE,
+     },
+    )
+  if failure is not None:
+   raise failure
+  if evidence is not None:
+   evidence.update({
+    'request_id':request_id,
+    'audit_id':audit_id,
+    'credential_id':response['credential_id'],
+    'registration_lifecycle_outcome':PENDING_STATE,
+   })
+  return (200 if replayed else 201),response
+ def recover_registration_v2(self,d,secret,*,request_id=None,evidence=None):
+  request_id=request_id or str(uuid.uuid4())
+  failure=None
+  response=None
+  audit_id=None
+  with self.store.transaction() as c:
+   bootstrap=self.auth.bootstrap(c,d['worker_id'],secret)
+   transaction=c.execute(
+    "SELECT * FROM worker_registration_transactions_v2 "
+    "WHERE registration_transaction_id=?",
+    (d['registration_transaction_id'],),
+   ).fetchone()
+   if (
+    transaction is None
+    or transaction['bootstrap_credential_id']!=bootstrap['credential_id']
+   ):
+    failure=error('invalid_credential')
+   elif transaction['recovery_count']>=MAX_RECOVERIES:
+    failure=error('rate_limited')
+   else:
+    c.execute(
+     "UPDATE worker_registration_transactions_v2 SET "
+     "recovery_count=recovery_count+1,last_recovered_at=? "
+     "WHERE registration_transaction_id=?",
+     (self.now(),d['registration_transaction_id']),
+    )
+    if not self._registration_v2_identity_matches(transaction,d):
+     failure=error('invalid_credential')
+    elif transaction['state']!=PENDING_STATE:
+     failure=error('state_conflict')
+    elif transaction['expires_at']<=self.now():
+     self._expire_registration_v2(c,transaction)
+     failure=error('registration_expired')
+    else:
+     token=self._recover_registration_v2_token(transaction,secret)
+     response=self._registration_v2_response(transaction,token)
+     audit_id=self._audit(
+      c,
+      'registration_v2_recovered',
+      worker_id=d['worker_id'],
+      instance_id=d['instance_id'],
+      registration_id=transaction['registration_id'],
+      details={
+       'request_id':request_id,
+       'registration_transaction_id':d['registration_transaction_id'],
+       'credential_id':transaction['credential_id'],
+       'host':d['host'],
+       'path_id':d['path_id'],
+       'state':PENDING_STATE,
+      },
+     )
+  if failure is not None:
+   raise failure
+  if evidence is not None:
+   evidence.update({'request_id':request_id,'audit_id':audit_id})
+  return response
+ def confirm_registration_v2(self,d,token,*,request_id=None,evidence=None):
+  request_id=request_id or str(uuid.uuid4())
+  failure=None
+  response=None
+  audit_id=None
+  with self.store.transaction() as c:
+   transaction=c.execute(
+    "SELECT t.*,c.token_hash,c.revoked_at AS credential_revoked_at "
+    "FROM worker_registration_transactions_v2 t "
+    "JOIN worker_credentials c ON c.credential_id=t.credential_id "
+    "WHERE t.registration_transaction_id=?",
+    (d['registration_transaction_id'],),
+   ).fetchone()
+   if (
+    transaction is None
+    or transaction['credential_id']!=d['credential_id']
+    or not self._registration_v2_identity_matches(transaction,d)
+    or not verify_access_token(token,transaction['token_hash'])
+    or not verify_installation_proof(token,d)
+   ):
+    failure=error('invalid_credential')
+   elif transaction['state']=='confirmed':
+    response={
+     'registration_id':transaction['registration_id'],
+     'credential_id':transaction['credential_id'],
+     'registration_transaction_id':transaction[
+      'registration_transaction_id'
+     ],
+     'state':'confirmed',
+     'confirmed_at':transaction['confirmed_at'],
+    }
+   elif transaction['state']!=PENDING_STATE:
+    failure=error('state_conflict')
+   elif transaction['expires_at']<=self.now():
+    self._expire_registration_v2(c,transaction)
+    failure=error('registration_expired')
+   elif transaction['credential_revoked_at'] is not None:
+    failure=error('invalid_credential')
+   else:
+    instance=c.execute(
+     "SELECT * FROM worker_instances WHERE registration_id=? "
+     "AND worker_id=? AND instance_id=?",
+     (
+      transaction['registration_id'],transaction['worker_id'],
+      transaction['instance_id'],
+     ),
+    ).fetchone()
+    if instance is None:
+     failure=error('state_conflict')
+    else:
+     previous_credential_id=instance['access_credential_id']
+     if previous_credential_id!=transaction['credential_id']:
+      self._retire_registration_dedup(
+       c,instance['registration_id'],previous_credential_id
+      )
+      self._invalidate_registration_deliveries(
+       c,instance['registration_id']
+      )
+      c.execute(
+       "UPDATE worker_credentials SET revoked_at=? "
+       "WHERE credential_id=? AND revoked_at IS NULL",
+       (self.now(),previous_credential_id),
+      )
+      previous_transaction=c.execute(
+       "SELECT registration_transaction_id FROM "
+       "worker_registration_transactions_v2 WHERE credential_id=? "
+       "AND state='confirmed'",
+       (previous_credential_id,),
+      ).fetchone()
+      if previous_transaction:
+       c.execute(
+        "UPDATE worker_registration_transactions_v2 SET "
+        "state='superseded',superseded_at=? "
+        "WHERE registration_transaction_id=? AND state='confirmed'",
+        (
+         self.now(),previous_transaction['registration_transaction_id'],
+        ),
+       )
+       self._audit(
+        c,
+        'registration_v2_superseded',
+        worker_id=transaction['worker_id'],
+        instance_id=transaction['instance_id'],
+        registration_id=transaction['registration_id'],
+        outcome='superseded',
+        reason_code='registration_lifecycle_rotated',
+        details={
+         'registration_transaction_id':previous_transaction[
+          'registration_transaction_id'
+         ],
+         'credential_id':previous_credential_id,
+         'state':'superseded',
+        },
+       )
+     confirmed_at=self.now()
+     c.execute(
+     "UPDATE worker_instances SET status='active',"
+      "worker_version=?,protocol_version='2',"
+      "access_credential_id=?,last_seen_at=?,current_task_id=NULL "
+      "WHERE registration_id=?",
+      (
+       transaction['worker_version'],transaction['credential_id'],confirmed_at,
+       transaction['registration_id'],
+      ),
+     )
+     changed=c.execute(
+      "UPDATE worker_credentials SET consumed_at=?,revoked_at=? "
+      "WHERE credential_id=? AND kind='bootstrap' "
+      "AND consumed_at IS NULL AND revoked_at IS NULL",
+      (
+       confirmed_at,confirmed_at,
+       transaction['bootstrap_credential_id'],
+      ),
+     ).rowcount
+     if changed!=1:
+      raise error('invalid_credential')
+     c.execute(
+      "UPDATE worker_registration_transactions_v2 SET "
+      "state='confirmed',confirmed_at=?,escrow_salt=NULL,"
+      "escrow_nonce=NULL,escrow_ciphertext=NULL "
+      "WHERE registration_transaction_id=? AND state=?",
+      (
+       confirmed_at,transaction['registration_transaction_id'],
+       PENDING_STATE,
+      ),
+     )
+     self._audit(
+      c,
+      'bootstrap_credential_consumed',
+      worker_id=transaction['worker_id'],
+      instance_id=transaction['instance_id'],
+      registration_id=transaction['registration_id'],
+      reason_code=transaction['bootstrap_credential_id'],
+     )
+     audit_id=self._audit(
+      c,
+      'registration_v2_confirmed',
+      worker_id=transaction['worker_id'],
+      instance_id=transaction['instance_id'],
+      registration_id=transaction['registration_id'],
+      details={
+       'request_id':request_id,
+       'registration_transaction_id':transaction[
+        'registration_transaction_id'
+       ],
+       'credential_id':transaction['credential_id'],
+       'host':transaction['host'],
+       'path_id':transaction['path_id'],
+       'state':'confirmed',
+      },
+     )
+     response={
+      'registration_id':transaction['registration_id'],
+      'credential_id':transaction['credential_id'],
+      'registration_transaction_id':transaction[
+       'registration_transaction_id'
+      ],
+      'state':'confirmed',
+      'confirmed_at':confirmed_at,
+     }
+  if failure is not None:
+   raise failure
+  if evidence is not None:
+   evidence.update({'request_id':request_id,'audit_id':audit_id})
+  return response
  def _context(self,c,token,d):
   row=self.auth.access(c,token)
   return self._assert_context(row,d)
