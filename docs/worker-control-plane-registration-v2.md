@@ -164,9 +164,10 @@ Only `issued_pending_confirmation -> confirmed` activates a credential.
 Expiry is fail-closed and revokes the pending credential. Other terminal
 states cannot recover or disclose a token. Pending expiry clears escrow and
 revokes only the pending access credential; it does not consume the
-bootstrap. Expiry is transactionally reaped on service startup, health
-maintenance, and lifecycle requests. The same bootstrap may start a new transaction until its own
-bounded expiry. After bootstrap expiry, operator reprovisioning is required.
+bootstrap. Expiry is transactionally reaped on service startup and authenticated
+lifecycle requests. The same bootstrap may start a new transaction until its
+own bounded expiry. After bootstrap expiry, operator reprovisioning is
+required.
 
 ## Audit and compatibility
 

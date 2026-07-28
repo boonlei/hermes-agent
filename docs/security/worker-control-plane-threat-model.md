@@ -106,4 +106,4 @@ misconfiguration risks rather than in-process containment failures.
   defense-in-depth improvement that does not cross the documented boundary.
 
 Repository: boonlei/hermes-agent
-Version: d98eaddbf7bb08d03bc4dadad260b8e29e529059
+Version: Registration Protocol v2 security model

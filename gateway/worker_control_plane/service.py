@@ -81,9 +81,7 @@ class WorkerControlPlaneService:
   advance=getattr(self._clock,'advance',None)
   if advance is None: raise RuntimeError('test clock was not injected')
   advance(seconds)
- def check_health(self):
-  self.reap_expired_registration_v2()
-  self.store.check_health()
+ def check_health(self): self.store.check_health()
  def close(self): self.store.close()
  def _audit(self,c,event,**fields):
   safe={k:v for k,v in fields.items() if k in {'worker_id','instance_id','registration_id','task_id','delivery_id','trace_id','outcome','reason_code'}}

@@ -520,6 +520,101 @@ async def test_expired_pending_transaction_cannot_recover(registration_v2):
 
 
 @pytest.mark.asyncio
+async def test_health_does_not_reap_expired_pending_transaction(
+    registration_v2,
+):
+    service, client, provisioned, clock, _ = registration_v2
+    instance_id = str(uuid.uuid4())
+    transaction_id = str(uuid.uuid4())
+    status, issued = await register_v2(
+        client,
+        provisioned["secret"],
+        register_body(instance_id, transaction_id),
+    )
+    assert status == 201
+    clock.advance(service.settings.token_ttl_seconds + 1)
+
+    connection = service.store.conn
+
+    def lifecycle_snapshot():
+        transaction = connection.execute(
+            "SELECT state,escrow_salt,escrow_nonce,escrow_ciphertext,"
+            "recovery_count,last_recovered_at FROM "
+            "worker_registration_transactions_v2 "
+            "WHERE registration_transaction_id=?",
+            (transaction_id,),
+        ).fetchone()
+        credential = connection.execute(
+            "SELECT revoked_at,consumed_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (issued["credential_id"],),
+        ).fetchone()
+        instance = connection.execute(
+            "SELECT status,access_credential_id FROM worker_instances "
+            "WHERE registration_id=?",
+            (issued["registration_id"],),
+        ).fetchone()
+        bootstrap = connection.execute(
+            "SELECT revoked_at,consumed_at FROM worker_credentials "
+            "WHERE credential_id=?",
+            (provisioned["credential_id"],),
+        ).fetchone()
+        return {
+            "transaction": tuple(transaction),
+            "credential": tuple(credential),
+            "instance": tuple(instance),
+            "bootstrap": tuple(bootstrap),
+            "audit_count": connection.execute(
+                "SELECT count(*) FROM worker_audit_log"
+            ).fetchone()[0],
+        }
+
+    before = lifecycle_snapshot()
+    assert before["transaction"][0] == "issued_pending_confirmation"
+    assert all(before["transaction"][index] is not None for index in (1, 2, 3))
+    assert before["credential"] == (None, None)
+    assert before["instance"] == (
+        "issued_pending_confirmation",
+        issued["credential_id"],
+    )
+    assert before["bootstrap"] == (None, None)
+    assert before["audit_count"] == 2
+    changes_before = connection.total_changes
+    statements = []
+    connection.set_trace_callback(statements.append)
+    try:
+        response = await client.get("/health")
+    finally:
+        connection.set_trace_callback(None)
+
+    assert response.status == 200
+    assert await response.json() == {"status": "ok"}
+    assert lifecycle_snapshot() == before
+    assert connection.total_changes == changes_before
+    assert not any(
+        statement.lstrip().upper().startswith(
+            ("BEGIN", "INSERT", "UPDATE", "DELETE")
+        )
+        for statement in statements
+    )
+
+    status, body = await recover_v2(
+        client,
+        provisioned["secret"],
+        recovery_body(instance_id, transaction_id),
+    )
+    assert status == 410
+    assert body["error"]["code"] == "registration_expired"
+    transaction = connection.execute(
+        "SELECT state,escrow_salt,escrow_nonce,escrow_ciphertext FROM "
+        "worker_registration_transactions_v2 "
+        "WHERE registration_transaction_id=?",
+        (transaction_id,),
+    ).fetchone()
+    assert tuple(transaction) == ("expired", None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_pending_expiry_allows_same_bootstrap_until_its_own_expiry(
     registration_v2,
 ):
