@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import uuid
 
@@ -26,6 +28,80 @@ class MockWorkerClient:
         requested_capabilities = (
             ["system.echo"] if capabilities is None else capabilities
         )
+        if requested_capabilities == ["system.echo", "codex.execute"]:
+            transaction_id = str(uuid.uuid4())
+            path_digest = hashlib.sha256(
+                b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker"
+            ).hexdigest()
+            target_identity = {
+                "path_digest": path_digest,
+                "remote": (
+                    "https://github.com/boonlei/HermesServerWorker.git"
+                ),
+                "branch": "main",
+                "approved_head": (
+                    "4092825b22184ad9820b4899b49fb1f833ac0b19"
+                ),
+            }
+            register_body = {
+                "protocol_version": 2,
+                "worker_id": self.worker_id,
+                "instance_id": self.instance_id,
+                "worker_name": "test worker",
+                "worker_version": worker_version,
+                "capabilities": requested_capabilities,
+                "host": "DESKTOP-87SSHTU",
+                "path_id": "hermes-server-worker",
+                "target_identity": target_identity,
+                "registration_transaction_id": transaction_id,
+            }
+            response = await self.client.post(
+                "/worker-control-plane/v2/register",
+                headers={
+                    "Authorization": (
+                        f"Worker-Bootstrap {self.bootstrap_secret}"
+                    )
+                },
+                json=register_body,
+            )
+            body = await response.json()
+            if response.status not in (200, 201):
+                return response.status, body
+            confirmation = {
+                "protocol_version": 2,
+                "worker_id": self.worker_id,
+                "instance_id": self.instance_id,
+                "registration_transaction_id": transaction_id,
+                "registration_id": body["registration_id"],
+                "host": "DESKTOP-87SSHTU",
+                "path_id": "hermes-server-worker",
+                "target_identity": target_identity,
+                "credential_id": body["credential_id"],
+            }
+            canonical = json.dumps(
+                confirmation,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            confirmation["installation_proof"] = hmac.new(
+                body["access_token"].encode("utf-8"),
+                canonical,
+                hashlib.sha256,
+            ).hexdigest()
+            confirmed = await self.client.post(
+                "/worker-control-plane/v2/registration/confirm",
+                headers={
+                    "Authorization": f"Bearer {body['access_token']}"
+                },
+                json=confirmation,
+            )
+            if confirmed.status != 200:
+                return confirmed.status, await confirmed.json()
+            self.registration_id = body["registration_id"]
+            self.access_token = body["access_token"]
+            self.capabilities = requested_capabilities
+            return response.status, body
         response = await self.client.post(
             "/worker/v1/register",
             headers={"Authorization": f"Worker-Bootstrap {self.bootstrap_secret}"},

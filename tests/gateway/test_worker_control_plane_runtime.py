@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -23,6 +24,14 @@ from gateway.worker_control_plane import storage as wcp_storage
 from gateway.worker_control_plane.auth import bootstrap_record
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
 from gateway.worker_control_plane.errors import WorkerControlPlaneError
+from gateway.worker_control_plane.registration_v2 import (
+    APPROVED_HEAD,
+    BRANCH,
+    HOST,
+    PATH_DIGEST,
+    PATH_ID,
+    REMOTE,
+)
 
 
 def _mode(path) -> int:
@@ -38,6 +47,56 @@ class MutableClock:
 
     def advance(self, seconds):
         self.value += timedelta(seconds=seconds)
+
+
+def _register_v2_direct(service, secret, instance_id, worker_name):
+    transaction_id = str(uuid.uuid4())
+    target_identity = {
+        "path_digest": PATH_DIGEST,
+        "remote": REMOTE,
+        "branch": BRANCH,
+        "approved_head": APPROVED_HEAD,
+    }
+    request = {
+        "protocol_version": 2,
+        "worker_id": "server-a-worker",
+        "instance_id": instance_id,
+        "worker_name": worker_name,
+        "worker_version": "0.1.0",
+        "capabilities": ["system.echo", "codex.execute"],
+        "host": HOST,
+        "path_id": PATH_ID,
+        "target_identity": target_identity,
+        "registration_transaction_id": transaction_id,
+    }
+    status, issued = service.register_worker_v2(request, secret)
+    confirmation = {
+        "protocol_version": 2,
+        "worker_id": "server-a-worker",
+        "instance_id": instance_id,
+        "registration_transaction_id": transaction_id,
+        "registration_id": issued["registration_id"],
+        "host": HOST,
+        "path_id": PATH_ID,
+        "target_identity": target_identity,
+        "credential_id": issued["credential_id"],
+    }
+    canonical = json.dumps(
+        confirmation,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    confirmation["installation_proof"] = hmac.new(
+        issued["access_token"].encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    service.confirm_registration_v2(
+        confirmation,
+        issued["access_token"],
+    )
+    return status, issued
 
 
 def test_pilot_provisioning_uses_owner_only_files_and_safe_storage(tmp_path):
@@ -194,16 +253,11 @@ def test_access_revocation_cannot_commit_between_auth_and_codex_lease(
         capabilities=["system.echo", "codex.execute"]
     )
     instance_id = str(uuid.uuid4())
-    _, registration = service.register_worker(
-        {
-            "protocol_version": "1.0",
-            "worker_id": "server-a-worker",
-            "instance_id": instance_id,
-            "worker_name": "transaction boundary worker",
-            "worker_version": "0.1.0",
-            "capabilities": ["system.echo", "codex.execute"],
-        },
+    _, registration = _register_v2_direct(
+        service,
         provisioned["secret"],
+        instance_id,
+        "transaction boundary worker",
     )
     identity = {
         "worker_id": "server-a-worker",
@@ -1801,8 +1855,9 @@ def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
             {
                 "worker_control_plane_schema_v1",
                 "worker_control_plane_bootstrap_lifecycle_v2",
-                wcp_storage.LIFECYCLE_MIGRATION_V3,
-                wcp_storage.CAPABILITY_MIGRATION_V4,
+                    wcp_storage.LIFECYCLE_MIGRATION_V3,
+                    wcp_storage.CAPABILITY_MIGRATION_V4,
+                    wcp_storage.REGISTRATION_TRANSACTION_MIGRATION_V5,
             }
         )
     finally:
@@ -1911,12 +1966,19 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
                 "SELECT version,applied_at FROM schema_migrations"
             )
         }
-        assert len(migrations) == 4
+        assert len(migrations) == 5
         assert tuple(
             (name, migrations[name]) for name, _ in legacy["migrations"]
         ) == legacy["migrations"]
         assert wcp_storage.LIFECYCLE_MIGRATION_V3 in migrations
         assert wcp_storage.CAPABILITY_MIGRATION_V4 in migrations
+        assert (
+            wcp_storage.REGISTRATION_TRANSACTION_MIGRATION_V5
+            in migrations
+        )
+        assert service.store.conn.execute(
+            "SELECT count(*) FROM worker_registration_transactions_v2"
+        ).fetchone()[0] == 0
         assert _v2_business_snapshot(settings.db_path) == before
         task_history_after = tuple(
             service.store.conn.execute(
@@ -2077,7 +2139,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             )
         }
         assert second_applied_at == applied_at
-        assert len(second_applied_at) == 4
+        assert len(second_applied_at) == 5
         reopened.check_health()
     finally:
         reopened.close()

@@ -1,6 +1,7 @@
 """Standalone aiohttp app factory for tests and the loopback-only pilot."""
 from __future__ import annotations
 
+import json
 import uuid
 from aiohttp import web
 
@@ -13,6 +14,14 @@ from .models import (
     require_worker_id,
 )
 from .service import WorkerControlPlaneService
+from .registration_v2 import (
+    CONFIRM_FIELDS,
+    RECOVERY_FIELDS,
+    REGISTER_FIELDS as REGISTER_V2,
+    validate_confirmation_request,
+    validate_recovery_request,
+    validate_register_request,
+)
 
 SERVICE_KEY: web.AppKey[WorkerControlPlaneService] = web.AppKey(
     "worker_control_plane_service", WorkerControlPlaneService
@@ -42,8 +51,20 @@ async def _json(
     fields: set[str],
     optional_fields: set[str] | None = None,
 ) -> dict:
+    def no_duplicates(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate_json_key")
+            value[key] = item
+        return value
+
     try:
-        body = await request.json()
+        raw = await request.read()
+        body = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+        )
     except web.HTTPRequestEntityTooLarge:
         raise
     except Exception:
@@ -57,6 +78,18 @@ async def _json(
         raise error("malformed_request")
     return body
 
+
+def _registration_v2_error(exc: ValueError) -> WorkerControlPlaneError:
+    code = str(exc)
+    if code in {
+        "invalid_credential",
+        "invalid_target_identity",
+        "unsupported_capability",
+        "unsupported_protocol",
+    }:
+        return error(code)
+    return error("malformed_request")
+
 def _identity(body: dict) -> None:
     require_worker_id(body["worker_id"])
     require_uuid(body["instance_id"], "instance_id")
@@ -68,9 +101,11 @@ def _register(body: dict) -> None:
     require_worker_id(body["worker_id"])
     require_uuid(body["instance_id"], "instance_id")
     try:
-        validate_capabilities(body["capabilities"])
+        capabilities = validate_capabilities(body["capabilities"])
     except ValueError:
         raise error("unsupported_capability")
+    if capabilities != ["system.echo"]:
+        raise error("unsupported_protocol")
 
 def _heartbeat(body: dict) -> None:
     _identity(body)
@@ -183,7 +218,8 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         request_id = str(uuid.uuid4())
         body = None
         try:
-            body = await _json(request, REGISTER); _register(body)
+            body = await _json(request, REGISTER)
+            _register(body)
             evidence = {}
             status, response = svc.register_worker(
                 body,
@@ -228,6 +264,183 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
                 lifecycle_outcome="request_rejected",
             )
             raise exc
+
+    async def register_v2(request: web.Request):
+        request_id = str(uuid.uuid4())
+        body = None
+        try:
+            body = await _json(request, REGISTER_V2)
+            try:
+                validate_register_request(body)
+            except ValueError as exc:
+                raise _registration_v2_error(exc) from None
+            evidence = {}
+            status, response = svc.register_worker_v2(
+                body,
+                _token(request, "Worker-Bootstrap"),
+                request_id=request_id,
+                evidence=evidence,
+            )
+            return web.json_response(
+                response,
+                status=status,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Audit-Event-ID": str(evidence["audit_id"]),
+                },
+            )
+        except WorkerControlPlaneError as exc:
+            context = exc.safe_context or {}
+            if exc.audit_id is None:
+                exc.request_id = request_id
+                exc.audit_id = svc.record_registration_failure(
+                    request_id=request_id,
+                    worker_id=context.get("worker_id") or (
+                        body.get("worker_id")
+                        if isinstance(body, dict)
+                        and isinstance(body.get("worker_id"), str)
+                        else None
+                    ),
+                    instance_id=context.get("instance_id") or (
+                        body.get("instance_id")
+                        if isinstance(body, dict)
+                        and isinstance(body.get("instance_id"), str)
+                        else None
+                    ),
+                    credential_id=context.get("credential_id"),
+                    registration_id=context.get("registration_id"),
+                    http_status=exc.status,
+                    error_code=exc.code,
+                    lifecycle_outcome=context.get(
+                        "registration_lifecycle_outcome",
+                        "request_rejected",
+                    ),
+                )
+            raise
+        except (TypeError, ValueError, KeyError):
+            exc = error("malformed_request")
+            exc.request_id = request_id
+            exc.audit_id = svc.record_registration_failure(
+                request_id=request_id,
+                worker_id=(
+                    body.get("worker_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("worker_id"), str)
+                    else None
+                ),
+                instance_id=(
+                    body.get("instance_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("instance_id"), str)
+                    else None
+                ),
+                credential_id=None,
+                registration_id=None,
+                http_status=exc.status,
+                error_code=exc.code,
+                lifecycle_outcome="request_rejected",
+            )
+            raise exc
+    async def recover_registration(request: web.Request):
+        request_id = str(uuid.uuid4())
+        body = None
+        try:
+            body = await _json(request, RECOVERY_FIELDS)
+            try:
+                validate_recovery_request(body)
+            except ValueError as exc:
+                raise _registration_v2_error(exc) from None
+            evidence = {}
+            response = svc.recover_registration_v2(
+                body,
+                _token(request, "Worker-Bootstrap"),
+                request_id=request_id,
+                evidence=evidence,
+            )
+            return web.json_response(
+                response,
+                headers={
+                    "X-Request-ID": request_id,
+                    "X-Audit-Event-ID": str(evidence["audit_id"]),
+                },
+            )
+        except WorkerControlPlaneError as exc:
+            exc.request_id = request_id
+            exc.audit_id = svc.record_registration_failure(
+                request_id=request_id,
+                worker_id=(
+                    body.get("worker_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("worker_id"), str)
+                    else None
+                ),
+                instance_id=(
+                    body.get("instance_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("instance_id"), str)
+                    else None
+                ),
+                credential_id=None,
+                registration_id=None,
+                http_status=exc.status,
+                error_code=exc.code,
+                lifecycle_outcome="recovery_rejected",
+            )
+            raise
+
+    async def confirm_registration(request: web.Request):
+        request_id = str(uuid.uuid4())
+        body = None
+        try:
+            body = await _json(request, CONFIRM_FIELDS)
+            try:
+                validate_confirmation_request(body)
+            except ValueError as exc:
+                raise _registration_v2_error(exc) from None
+            evidence = {}
+            response = svc.confirm_registration_v2(
+                body,
+                _token(request, "Bearer"),
+                request_id=request_id,
+                evidence=evidence,
+            )
+            headers = {"X-Request-ID": request_id}
+            if evidence.get("audit_id") is not None:
+                headers["X-Audit-Event-ID"] = str(evidence["audit_id"])
+            return web.json_response(response, headers=headers)
+        except WorkerControlPlaneError as exc:
+            exc.request_id = request_id
+            exc.audit_id = svc.record_registration_failure(
+                request_id=request_id,
+                worker_id=(
+                    body.get("worker_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("worker_id"), str)
+                    else None
+                ),
+                instance_id=(
+                    body.get("instance_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("instance_id"), str)
+                    else None
+                ),
+                credential_id=(
+                    body.get("credential_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("credential_id"), str)
+                    else None
+                ),
+                registration_id=(
+                    body.get("registration_id")
+                    if isinstance(body, dict)
+                    and isinstance(body.get("registration_id"), str)
+                    else None
+                ),
+                http_status=exc.status,
+                error_code=exc.code,
+                lifecycle_outcome="confirmation_rejected",
+            )
+            raise
     @audited("heartbeat_rejected")
     async def heartbeat(request: web.Request):
         body = await _json(request, HEARTBEAT); _heartbeat(body)
@@ -251,6 +464,15 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         allow_head=False,
     )
     app.router.add_post("/worker/v1/register", register)
+    app.router.add_post("/worker-control-plane/v2/register", register_v2)
+    app.router.add_post(
+        "/worker-control-plane/v2/registration/recover",
+        recover_registration,
+    )
+    app.router.add_post(
+        "/worker-control-plane/v2/registration/confirm",
+        confirm_registration,
+    )
     app.router.add_post("/worker/v1/heartbeat", heartbeat)
     app.router.add_post("/worker/v1/tasks/poll", poll)
     app.router.add_post("/worker/v1/tasks/{task_id}/ack", ack)
