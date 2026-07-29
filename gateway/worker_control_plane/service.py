@@ -82,6 +82,47 @@ class WorkerControlPlaneService:
   if advance is None: raise RuntimeError('test clock was not injected')
   advance(seconds)
  def check_health(self): self.store.check_health()
+ def registration_status(self, token, instance_id, registration_id):
+  row=self.auth.access(self.store.conn,token)
+  self._assert_context(
+   row,
+   {
+    'worker_id':row['worker_id'],
+    'instance_id':instance_id,
+    'registration_id':registration_id,
+   },
+  )
+  transaction=self.store.conn.execute(
+   "SELECT state,capabilities_json,expires_at FROM "
+   "worker_registration_transactions_v2 WHERE registration_id=? "
+   "AND credential_id=? AND instance_id=?",
+   (registration_id,row['credential_id'],instance_id),
+  ).fetchone()
+  if transaction is None or transaction['state']!='confirmed':
+   raise error('invalid_credential')
+  try:
+   capabilities=validate_capabilities(json.loads(row['capabilities_json']))
+   transaction_capabilities=validate_capabilities(
+    json.loads(transaction['capabilities_json'])
+   )
+  except (TypeError,ValueError,json.JSONDecodeError):
+   raise error('invalid_credential') from None
+  if (
+   capabilities!=REGISTRATION_V2_CAPABILITIES
+   or transaction_capabilities!=REGISTRATION_V2_CAPABILITIES
+   or transaction['expires_at']!=row['expires_at']
+  ):
+   raise error('invalid_credential')
+  return {
+   'protocol_version':2,
+   'worker_id':row['worker_id'],
+   'instance_id':row['instance_id'],
+   'registration_id':row['registration_id'],
+   'credential_id':row['credential_id'],
+   'state':'confirmed',
+   'capabilities':capabilities,
+   'expires_at':row['expires_at'],
+  }
  def close(self): self.store.close()
  def _audit(self,c,event,**fields):
   safe={k:v for k,v in fields.items() if k in {'worker_id','instance_id','registration_id','task_id','delivery_id','trace_id','outcome','reason_code'}}

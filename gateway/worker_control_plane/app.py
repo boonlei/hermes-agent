@@ -18,9 +18,11 @@ from .registration_v2 import (
     CONFIRM_FIELDS,
     RECOVERY_FIELDS,
     REGISTER_FIELDS as REGISTER_V2,
+    STATUS_FIELDS,
     validate_confirmation_request,
     validate_recovery_request,
     validate_register_request,
+    validate_status_request,
 )
 
 SERVICE_KEY: web.AppKey[WorkerControlPlaneService] = web.AppKey(
@@ -441,6 +443,25 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
                 lifecycle_outcome="confirmation_rejected",
             )
             raise
+    async def registration_status(request: web.Request):
+        query = request.query
+        if (
+            set(query) != STATUS_FIELDS
+            or any(len(query.getall(field)) != 1 for field in STATUS_FIELDS)
+        ):
+            raise error("malformed_request")
+        try:
+            identity = validate_status_request(
+                {field: query[field] for field in STATUS_FIELDS}
+            )
+        except ValueError:
+            raise error("malformed_request") from None
+        response = svc.registration_status(
+            _token(request, "Bearer"),
+            identity["instance_id"],
+            identity["registration_id"],
+        )
+        return web.json_response(response)
     @audited("heartbeat_rejected")
     async def heartbeat(request: web.Request):
         body = await _json(request, HEARTBEAT); _heartbeat(body)
@@ -472,6 +493,11 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
     app.router.add_post(
         "/worker-control-plane/v2/registration/confirm",
         confirm_registration,
+    )
+    app.router.add_get(
+        "/worker-control-plane/v2/registration/status",
+        registration_status,
+        allow_head=False,
     )
     app.router.add_post("/worker/v1/heartbeat", heartbeat)
     app.router.add_post("/worker/v1/tasks/poll", poll)

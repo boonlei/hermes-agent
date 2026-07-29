@@ -47,6 +47,9 @@ Security invariants:
 6. SQLite, logs, errors, audit records, and response metadata never contain a
    plaintext token or bootstrap secret.
 7. V1 registrations remain compatible and cannot bypass v2 state checks.
+8. Authentication-only status requires the confirmed access credential and
+   exact registration, instance, and dual-capability binding while performing
+   no protocol or audit mutation.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
@@ -69,6 +72,12 @@ An attacker with a pending token cannot Poll or submit protocol messages.
 They can only confirm the matching pending transaction with an exact
 installation proof. Confirmation atomically activates that credential and
 retires the bootstrap and previous access lifecycle.
+
+The authenticated Registration v2 status route reuses the authoritative
+constant-time access-token verifier and active-registration gate, then
+requires the exact confirmed v2 transaction and capability set. It exposes
+only bounded non-secret identity, state, capability, and expiry metadata and
+uses no write transaction or audit path.
 
 Database theft exposes token hashes and encrypted escrow, not plaintext
 tokens. Offline recovery still depends on the high-entropy bootstrap. Audit

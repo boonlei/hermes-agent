@@ -31,7 +31,8 @@ class MockWorkerClient:
         if requested_capabilities == ["system.echo", "codex.execute"]:
             transaction_id = str(uuid.uuid4())
             path_digest = hashlib.sha256(
-                b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker"
+                b"windows-path-v1|desktop-87sshtu|"
+                b"c:\\hermesserverworker-deploy"
             ).hexdigest()
             target_identity = {
                 "path_digest": path_digest,
