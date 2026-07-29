@@ -41,7 +41,7 @@ class MockWorkerClient:
                 ),
                 "branch": "main",
                 "approved_head": (
-                    "4092825b22184ad9820b4899b49fb1f833ac0b19"
+                    "dbdc56792d1926fb19b7e22e1a282fd96a82cd76"
                 ),
             }
             register_body = {

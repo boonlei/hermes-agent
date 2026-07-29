@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
 import signal
+import sqlite3
 import stat
 import sys
 import uuid
@@ -20,6 +22,7 @@ from typing import Final
 from aiohttp import web
 
 from .app import create_worker_control_plane_app
+from .auth import verify_bootstrap
 from .config import PILOT_DATA_DIRECTORY, WorkerControlPlaneSettings
 from .models import (
     CODEX_EXECUTE_MODE,
@@ -28,11 +31,25 @@ from .models import (
     KNOWN_CAPABILITIES,
 )
 from .service import WorkerControlPlaneService
+from .registration_v2 import (
+    APPROVED_HEAD,
+    BRANCH,
+    CAPABILITIES as REGISTRATION_V2_CAPABILITIES,
+    HOST,
+    PATH_DIGEST,
+    PATH_ID,
+    REMOTE,
+    WORKER_ID,
+)
 
 
 _LOOPBACK_ADDRESS: Final = "127.0.0.1"
 DEFAULT_PORT = 8765
 CREDENTIAL_FILE_NAME = "bootstrap-secret"
+LEGACY_CREDENTIAL_FILE_NAMES = frozenset(
+    {"bootstrap.secret", "bootstrap-secret"}
+)
+HANDOFF_ROUTE = "/worker-control-plane/v2/registration/bootstrap"
 
 
 def _validate_secure_directory_chain(path: Path, *, owner_from: Path) -> None:
@@ -307,6 +324,433 @@ def provision_local_worker(
     }
 
 
+def _canonical_uuid(value: str, field: str) -> str:
+    try:
+        canonical = str(uuid.UUID(value))
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a canonical UUID") from None
+    if value != canonical:
+        raise ValueError(f"{field} must be a canonical UUID")
+    return canonical
+
+
+def _tailnet_ipv4(value: str) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ValueError("expected source must be a Tailnet IPv4 address") from None
+    if (
+        address.version != 4
+        or address not in ipaddress.ip_network("100.64.0.0/10")
+    ):
+        raise ValueError("expected source must be a Tailnet IPv4 address")
+    return address.compressed
+
+
+def provision_registration_v2_handoff(
+    settings: WorkerControlPlaneSettings,
+    *,
+    instance_id: str,
+    registration_transaction_id: str,
+    expected_source_ip: str,
+    ttl_seconds: int = 900,
+) -> dict:
+    instance_id = _canonical_uuid(instance_id, "instance_id")
+    registration_transaction_id = _canonical_uuid(
+        registration_transaction_id, "registration_transaction_id"
+    )
+    expected_source_ip = _tailnet_ipv4(expected_source_ip)
+    file_name = (
+        f".registration-v2-handoff-{registration_transaction_id}.secret"
+    )
+    root_fd = _open_verified_root(settings)
+    temporary = None
+    try:
+        if _credential_destination_exists(root_fd, file_name):
+            raise ValueError("handoff destination already exists")
+        secret = secrets.token_urlsafe(32)
+        temporary = _stage_owner_only_secret(root_fd, file_name, secret)
+        service = WorkerControlPlaneService(settings)
+        try:
+            provisioned = service.provision_worker(
+                secret=secret,
+                ttl_seconds=ttl_seconds,
+                single_use=True,
+                capabilities=list(REGISTRATION_V2_CAPABILITIES),
+                handoff={
+                    "registration_transaction_id": (
+                        registration_transaction_id
+                    ),
+                    "instance_id": instance_id,
+                    "secret_file_name": file_name,
+                    "expected_source_ip": expected_source_ip,
+                },
+                install_credential=lambda: _install_staged_secret(
+                    root_fd,
+                    settings.approved_test_root,
+                    file_name,
+                    temporary,
+                ),
+            )
+            temporary = None
+        finally:
+            service.close()
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+        os.close(root_fd)
+    return {
+        "registration_transaction_id": registration_transaction_id,
+        "worker_id": WORKER_ID,
+        "instance_id": instance_id,
+        "credential_id": provisioned["credential_id"],
+        "issued_at": provisioned["issued_at"],
+        "expires_at": provisioned["expires_at"],
+        "capabilities": list(REGISTRATION_V2_CAPABILITIES),
+        "target_identity": {
+            "host": HOST,
+            "path_id": PATH_ID,
+            "path_digest": PATH_DIGEST,
+            "remote": REMOTE,
+            "branch": BRANCH,
+            "approved_head": APPROVED_HEAD,
+        },
+        "expected_source_ip": expected_source_ip,
+        "handoff_route": HANDOFF_ROUTE,
+        "single_use": True,
+    }
+
+
+def _read_only_connection(settings: WorkerControlPlaneSettings):
+    connection = sqlite3.connect(
+        f"file:{settings.db_path}?mode=ro",
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def commissioning_postcheck(
+    settings: WorkerControlPlaneSettings,
+    *,
+    registration_transaction_id: str,
+    task_id: str | None = None,
+) -> dict:
+    registration_transaction_id = _canonical_uuid(
+        registration_transaction_id, "registration_transaction_id"
+    )
+    if task_id is not None:
+        task_id = _canonical_uuid(task_id, "task_id")
+    connection = _read_only_connection(settings)
+    try:
+        before = connection.total_changes
+        transaction = connection.execute(
+            "SELECT t.registration_transaction_id,t.state,t.worker_id,"
+            "t.instance_id,t.registration_id,t.credential_id,t.host,"
+            "t.path_id,t.path_digest,t.remote,t.branch,t.approved_head,"
+            "t.capabilities_json,t.expires_at,t.confirmed_at,"
+            "t.bootstrap_credential_id,h.state AS handoff_state,"
+            "h.retrieved_at,b.consumed_at AS bootstrap_consumed_at,"
+            "b.revoked_at AS bootstrap_revoked_at,i.status AS instance_state "
+            "FROM worker_registration_transactions_v2 t "
+            "LEFT JOIN worker_registration_handoffs_v2 h USING("
+            "registration_transaction_id) "
+            "JOIN worker_credentials b ON b.credential_id="
+            "t.bootstrap_credential_id "
+            "JOIN worker_instances i ON i.registration_id=t.registration_id "
+            "WHERE t.registration_transaction_id=?",
+            (registration_transaction_id,),
+        ).fetchone()
+        handoff = connection.execute(
+            "SELECT registration_transaction_id,state,worker_id,instance_id,"
+            "bootstrap_credential_id,expected_source_ip,host,path_id,"
+            "path_digest,remote,branch,approved_head,capabilities_json,"
+            "issued_at,expires_at,retrieved_at "
+            "FROM worker_registration_handoffs_v2 "
+            "WHERE registration_transaction_id=?",
+            (registration_transaction_id,),
+        ).fetchone()
+        task = None
+        if task_id is not None:
+            task_row = connection.execute(
+                "SELECT task_id,task_type,state,attempt,max_attempts,worker_id "
+                "FROM worker_tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if task_row is not None:
+                delivery_count = connection.execute(
+                    "SELECT count(*) FROM worker_deliveries WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+                ack_count = connection.execute(
+                    "SELECT count(*) FROM worker_deliveries WHERE task_id=? "
+                    "AND acknowledged_at IS NOT NULL",
+                    (task_id,),
+                ).fetchone()[0]
+                result_count = connection.execute(
+                    "SELECT count(*) FROM worker_results WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()[0]
+                task_events = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT event_type FROM worker_audit_log "
+                        "WHERE task_id=? ORDER BY audit_id",
+                        (task_id,),
+                    )
+                ]
+                task = {
+                    "task_id": task_row["task_id"],
+                    "type": task_row["task_type"],
+                    "state": task_row["state"],
+                    "poll_deliveries": delivery_count,
+                    "ack_count": ack_count,
+                    "result_count": result_count,
+                    "retry_count": max(0, delivery_count - 1),
+                    "duplicate_count": max(0, result_count - 1),
+                    "audit_events": task_events,
+                }
+        pending_tasks = connection.execute(
+            "SELECT count(*) FROM worker_tasks WHERE state IN "
+            "('queued','leased','running')"
+        ).fetchone()[0]
+        quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+        foreign_key_errors = len(
+            connection.execute("PRAGMA foreign_key_check").fetchall()
+        )
+        audit_rows = connection.execute(
+            "SELECT event_type,details_json FROM worker_audit_log "
+            "WHERE details_json IS NOT NULL"
+        ).fetchall()
+        forbidden = ("bootstrap_secret", "access_token", "authorization")
+        redaction_ok = all(
+            not any(
+                marker in (row["details_json"] or "").lower()
+                for marker in forbidden
+            )
+            for row in audit_rows
+        )
+        if connection.total_changes != before:
+            raise RuntimeError("read-only postcheck attempted a database write")
+        return {
+            "registration": (
+                None
+                if transaction is None
+                else {
+                    key: (
+                        json.loads(transaction[key])
+                        if key == "capabilities_json"
+                        else transaction[key]
+                    )
+                    for key in transaction.keys()
+                }
+            ),
+            "handoff": (
+                None
+                if handoff is None
+                else {
+                    key: (
+                        json.loads(handoff[key])
+                        if key == "capabilities_json"
+                        else handoff[key]
+                    )
+                    for key in handoff.keys()
+                }
+            ),
+            "task": task,
+            "integrity": {
+                "quick_check": quick_check,
+                "foreign_key_errors": foreign_key_errors,
+                "pending_tasks": pending_tasks,
+                "audit_secret_redaction": redaction_ok,
+            },
+            "db_writes": 0,
+        }
+    finally:
+        connection.close()
+
+
+def _process_has_open_inode(device: int, inode: int) -> bool:
+    for process in Path("/proc").iterdir():
+        if not process.name.isdigit():
+            continue
+        if process.name == str(os.getpid()):
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+        except FileNotFoundError:
+            continue
+        directory = process / "fd"
+        try:
+            descriptors = list(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            continue
+        for descriptor in descriptors:
+            try:
+                info = descriptor.stat()
+            except (FileNotFoundError, PermissionError):
+                continue
+            if (info.st_dev, info.st_ino) == (device, inode):
+                return True
+    return False
+
+
+def inspect_legacy_bootstrap_artifact(
+    settings: WorkerControlPlaneSettings, file_name: str
+) -> dict:
+    if file_name not in LEGACY_CREDENTIAL_FILE_NAMES:
+        raise ValueError("legacy artifact name is not allowlisted")
+    root_fd = _open_verified_root(settings)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            file_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(file_name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+            or opened.st_size > 128
+        ):
+            raise ValueError("legacy artifact identity is unsafe")
+        secret = os.read(descriptor, 129).decode("ascii")
+        if not secret or len(secret.encode("ascii")) > 128:
+            raise ValueError("legacy artifact is malformed")
+        connection = _read_only_connection(settings)
+        try:
+            matches = []
+            for row in connection.execute(
+                "SELECT credential_id,salt,token_hash,expires_at,revoked_at,"
+                "consumed_at,lifecycle_version FROM worker_credentials "
+                "WHERE kind='bootstrap'"
+            ):
+                try:
+                    if verify_bootstrap(
+                        secret, row["salt"], row["token_hash"]
+                    ):
+                        matches.append(row)
+                except (TypeError, ValueError):
+                    continue
+            if not matches:
+                raise ValueError("legacy artifact origin is ambiguous")
+            active = []
+            now = datetime.now().astimezone()
+            for row in matches:
+                try:
+                    expiry = datetime.fromisoformat(
+                        row["expires_at"].replace("Z", "+00:00")
+                    )
+                except (AttributeError, ValueError):
+                    expiry = None
+                if (
+                    row["lifecycle_version"] == 3
+                    and row["revoked_at"] is None
+                    and row["consumed_at"] is None
+                    and expiry is not None
+                    and expiry.tzinfo is not None
+                    and expiry > now
+                ):
+                    active.append(row["credential_id"])
+            referenced = connection.execute(
+                "SELECT count(*) FROM worker_registration_transactions_v2 "
+                "WHERE bootstrap_credential_id IN (%s) AND state IN "
+                "('issued_pending_confirmation','confirmed')"
+                % ",".join("?" for _ in matches),
+                tuple(row["credential_id"] for row in matches),
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        if active or referenced or _process_has_open_inode(
+            opened.st_dev, opened.st_ino
+        ):
+            raise ValueError("legacy artifact is active or referenced")
+        return {
+            "file_name": file_name,
+            "owner_uid": opened.st_uid,
+            "mode": f"{stat.S_IMODE(opened.st_mode):04o}",
+            "link_count": opened.st_nlink,
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "matched_credential_ids": [
+                row["credential_id"] for row in matches
+            ],
+            "orphan_verified": True,
+        }
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+
+
+def delete_verified_legacy_bootstrap_artifact(
+    settings: WorkerControlPlaneSettings, file_name: str
+) -> dict:
+    evidence = inspect_legacy_bootstrap_artifact(settings, file_name)
+    root_fd = _open_verified_root(settings)
+    connection = sqlite3.connect(settings.db_path)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        current = os.stat(file_name, dir_fd=root_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (
+            evidence["device"],
+            evidence["inode"],
+        ):
+            raise ValueError("legacy artifact identity changed")
+        connection.execute(
+            "INSERT INTO worker_audit_log("
+            "occurred_at,event_type,worker_id,instance_id,registration_id,"
+            "task_id,delivery_id,trace_id,outcome,reason_code,details_json"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                datetime.now().astimezone().isoformat(),
+                "legacy_bootstrap_artifact_deleted",
+                WORKER_ID,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "deleted",
+                "verified_orphan",
+                json.dumps(
+                    {"file_name": file_name},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        os.unlink(file_name, dir_fd=root_fd)
+        os.fsync(root_fd)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+        os.close(root_fd)
+    return {
+        "file_name": file_name,
+        "orphan_verified": True,
+        "deleted": True,
+        "audit_event": "legacy_bootstrap_artifact_deleted",
+    }
+
+
 def list_bootstrap_credentials(
     settings: WorkerControlPlaneSettings, worker_id: str
 ) -> list[dict]:
@@ -576,6 +1020,43 @@ def build_parser() -> argparse.ArgumentParser:
     registration_revoke.add_argument(
         "--registration-id", type=_uuid, required=True
     )
+    commission = commands.add_parser(
+        "commission", help="operate Registration v2 commissioning safely"
+    )
+    commission_commands = commission.add_subparsers(
+        dest="commission_command", required=True
+    )
+    commission_provision = commission_commands.add_parser(
+        "provision", help="authorize one protected Registration v2 handoff"
+    )
+    commission_provision.add_argument(
+        "--instance-id", type=_uuid, required=True
+    )
+    commission_provision.add_argument(
+        "--transaction-id", type=_uuid, required=True
+    )
+    commission_provision.add_argument(
+        "--expected-source-ip", required=True
+    )
+    commission_provision.add_argument(
+        "--ttl-seconds", type=_bootstrap_ttl, default=900
+    )
+    commission_status = commission_commands.add_parser(
+        "status", help="read-only Registration v2 commissioning postcheck"
+    )
+    commission_status.add_argument(
+        "--transaction-id", type=_uuid, required=True
+    )
+    commission_status.add_argument("--task-id", type=_uuid)
+    artifact = commission_commands.add_parser(
+        "legacy-artifact", help="inspect or delete one verified orphan"
+    )
+    artifact.add_argument(
+        "action", choices=("inspect", "delete")
+    )
+    artifact.add_argument(
+        "--name", choices=sorted(LEGACY_CREDENTIAL_FILE_NAMES), required=True
+    )
     enqueue = commands.add_parser("enqueue", help="enqueue one local pilot task")
     enqueue.add_argument("task_type", choices=KNOWN_CAPABILITIES)
     enqueue.add_argument("message")
@@ -618,6 +1099,31 @@ def main(argv: list[str] | None = None) -> int:
                 parsed.worker_id,
                 parsed.instance_id,
                 parsed.registration_id,
+            )
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+        return 0
+    if parsed.command == "commission":
+        if parsed.commission_command == "provision":
+            report = provision_registration_v2_handoff(
+                settings,
+                instance_id=parsed.instance_id,
+                registration_transaction_id=parsed.transaction_id,
+                expected_source_ip=parsed.expected_source_ip,
+                ttl_seconds=parsed.ttl_seconds,
+            )
+        elif parsed.commission_command == "status":
+            report = commissioning_postcheck(
+                settings,
+                registration_transaction_id=parsed.transaction_id,
+                task_id=parsed.task_id,
+            )
+        elif parsed.action == "inspect":
+            report = inspect_legacy_bootstrap_artifact(
+                settings, parsed.name
+            )
+        else:
+            report = delete_verified_legacy_bootstrap_artifact(
+                settings, parsed.name
             )
         print(json.dumps(report, sort_keys=True, separators=(",", ":")))
         return 0

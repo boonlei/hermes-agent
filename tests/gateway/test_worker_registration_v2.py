@@ -24,7 +24,7 @@ HOST = "DESKTOP-87SSHTU"
 PATH_ID = "hermes-server-worker"
 REMOTE = "https://github.com/boonlei/HermesServerWorker.git"
 BRANCH = "main"
-APPROVED_HEAD = "4092825b22184ad9820b4899b49fb1f833ac0b19"
+APPROVED_HEAD = "dbdc56792d1926fb19b7e22e1a282fd96a82cd76"
 CAPABILITIES = ["system.echo", "codex.execute"]
 PATH_DIGEST = hashlib.sha256(
     b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker-deploy"
