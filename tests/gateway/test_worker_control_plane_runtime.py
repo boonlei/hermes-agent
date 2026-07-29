@@ -159,6 +159,16 @@ def test_codex_execute_admin_path_builds_only_fixed_structured_payload(
         credential,
         capabilities=["system.echo", "codex.execute"],
     )
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        _register_v2_direct(
+            service,
+            credential.read_text(encoding="utf-8"),
+            str(uuid.uuid4()),
+            "test worker",
+        )
+    finally:
+        service.close()
 
     task_id = pilot.enqueue_local_codex_execute(
         settings,
@@ -201,6 +211,16 @@ def test_concurrent_codex_execute_creation_allows_only_one_active_task(
         credential,
         capabilities=["system.echo", "codex.execute"],
     )
+    service = pilot.WorkerControlPlaneService(settings)
+    try:
+        _register_v2_direct(
+            service,
+            credential.read_text(encoding="utf-8"),
+            str(uuid.uuid4()),
+            "test worker",
+        )
+    finally:
+        service.close()
     start = Event()
 
     def create(index):
@@ -1858,6 +1878,7 @@ def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
                     wcp_storage.LIFECYCLE_MIGRATION_V3,
                     wcp_storage.CAPABILITY_MIGRATION_V4,
                     wcp_storage.REGISTRATION_TRANSACTION_MIGRATION_V5,
+                    wcp_storage.REGISTRATION_HANDOFF_MIGRATION_V6,
             }
         )
     finally:
@@ -1966,7 +1987,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
                 "SELECT version,applied_at FROM schema_migrations"
             )
         }
-        assert len(migrations) == 5
+        assert len(migrations) == 6
         assert tuple(
             (name, migrations[name]) for name, _ in legacy["migrations"]
         ) == legacy["migrations"]
@@ -1976,6 +1997,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             wcp_storage.REGISTRATION_TRANSACTION_MIGRATION_V5
             in migrations
         )
+        assert wcp_storage.REGISTRATION_HANDOFF_MIGRATION_V6 in migrations
         assert service.store.conn.execute(
             "SELECT count(*) FROM worker_registration_transactions_v2"
         ).fetchone()[0] == 0
@@ -2139,7 +2161,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             )
         }
         assert second_applied_at == applied_at
-        assert len(second_applied_at) == 5
+        assert len(second_applied_at) == 6
         reopened.check_health()
     finally:
         reopened.close()

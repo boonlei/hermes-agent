@@ -18,9 +18,16 @@ from .models import (
  validate_system_echo_payload,
 )
 from .registration_v2 import (
+ APPROVED_HEAD,
+ BRANCH,
  CAPABILITIES as REGISTRATION_V2_CAPABILITIES,
+ HOST,
  MAX_RECOVERIES,
+ PATH_DIGEST,
+ PATH_ID,
  PENDING_STATE,
+ REMOTE,
+ WORKER_ID,
  WrappedToken,
  identity_aad,
  request_hash,
@@ -64,7 +71,24 @@ class WorkerAuthService:
    allowed=validate_capabilities(json.loads(row['allowed_capabilities']))
   except (TypeError,ValueError,json.JSONDecodeError):
    raise error('invalid_credential') from None
-  if not set(capabilities)<=set(allowed): raise error('invalid_credential')
+   if not set(capabilities)<=set(allowed): raise error('invalid_credential')
+  if capabilities==REGISTRATION_V2_CAPABILITIES:
+   transaction=c.execute(
+    "SELECT state,host,path_id,path_digest,remote,branch,approved_head,"
+    "capabilities_json FROM worker_registration_transactions_v2 "
+    "WHERE worker_id=? AND instance_id=? AND registration_id=? "
+    "AND credential_id=?",
+    (
+     row['worker_id'],row['instance_id'],row['registration_id'],
+     row['credential_id'],
+    ),
+   ).fetchone()
+   expected=(
+    'confirmed',HOST,PATH_ID,PATH_DIGEST,REMOTE,BRANCH,APPROVED_HEAD,
+    json.dumps(REGISTRATION_V2_CAPABILITIES,separators=(',',':')),
+   )
+   if transaction is None or tuple(transaction)!=expected:
+    raise error('invalid_credential')
   return row
 
 class WorkerControlPlaneService:
@@ -93,7 +117,8 @@ class WorkerControlPlaneService:
    },
   )
   transaction=self.store.conn.execute(
-   "SELECT state,capabilities_json,expires_at FROM "
+   "SELECT state,capabilities_json,expires_at,host,path_id,path_digest,"
+   "remote,branch,approved_head FROM "
    "worker_registration_transactions_v2 WHERE registration_id=? "
    "AND credential_id=? AND instance_id=?",
    (registration_id,row['credential_id'],instance_id),
@@ -111,6 +136,10 @@ class WorkerControlPlaneService:
    capabilities!=REGISTRATION_V2_CAPABILITIES
    or transaction_capabilities!=REGISTRATION_V2_CAPABILITIES
    or transaction['expires_at']!=row['expires_at']
+   or transaction['host']!=HOST or transaction['path_id']!=PATH_ID
+   or transaction['path_digest']!=PATH_DIGEST
+   or transaction['remote']!=REMOTE or transaction['branch']!=BRANCH
+   or transaction['approved_head']!=APPROVED_HEAD
   ):
    raise error('invalid_credential')
   return {
@@ -138,7 +167,7 @@ class WorkerControlPlaneService:
    if error_code=='invalid_credential':
     self._audit(c,'credential_failed',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id,outcome='rejected',reason_code=error_code)
    return self._audit(c,'registration_rejected',worker_id=worker_id,instance_id=instance_id,registration_id=registration_id,outcome='rejected',reason_code=error_code,details=details)
- def provision_worker(self, *, secret=None, ttl_seconds=900, single_use=True, capabilities=None, install_credential=None):
+ def provision_worker(self, *, secret=None, ttl_seconds=900, single_use=True, capabilities=None, install_credential=None, handoff=None):
   if not (self.settings.test_mode or self.settings.pilot_mode): raise RuntimeError('isolated mode required')
   if type(ttl_seconds) is not int or not 1<=ttl_seconds<=900: raise ValueError('bootstrap TTL must be between 1 and 900 seconds')
   if type(single_use) is not bool: raise ValueError('single_use must be boolean')
@@ -154,12 +183,96 @@ class WorkerControlPlaneService:
     if c.execute("SELECT 1 FROM worker_credentials WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",('server-a-worker',)).fetchone():
      raise ValueError('an unrevoked bootstrap credential already exists')
     c.execute("INSERT INTO worker_credentials(credential_id,worker_id,kind,token_hash,salt,issued_at,expires_at,revoked_at,single_use,consumed_at,lifecycle_version,capabilities_json) VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)",(credential_id,'server-a-worker','bootstrap',digest,salt,issued_at,expires_at,None,int(single_use),CURRENT_LIFECYCLE_VERSION,capabilities_json)); self._audit(c,'worker_provisioned',worker_id='server-a-worker',reason_code=credential_id)
+    if handoff is not None:
+     c.execute(
+      "INSERT INTO worker_registration_handoffs_v2("
+      "registration_transaction_id,worker_id,instance_id,"
+      "bootstrap_credential_id,secret_file_name,expected_source_ip,"
+      "host,path_id,path_digest,remote,branch,approved_head,"
+      "capabilities_json,state,issued_at,expires_at,retrieved_at"
+      ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,NULL)",
+      (
+       handoff['registration_transaction_id'],WORKER_ID,
+       handoff['instance_id'],credential_id,handoff['secret_file_name'],
+       handoff['expected_source_ip'],HOST,PATH_ID,PATH_DIGEST,REMOTE,
+       BRANCH,APPROVED_HEAD,capabilities_json,issued_at,expires_at,
+      ),
+     )
+     self._audit(
+      c,'registration_v2_handoff_authorized',worker_id=WORKER_ID,
+      instance_id=handoff['instance_id'],outcome='pending',
+      reason_code=handoff['registration_transaction_id'],
+     )
     if install_credential is not None: rollback_file,finalize_file=install_credential()
   except Exception:
    if rollback_file is not None: rollback_file()
    raise
   if finalize_file is not None: finalize_file()
   return {'secret':secret,'credential_id':credential_id,'issued_at':issued_at,'expires_at':expires_at,'single_use':single_use,'capabilities':capabilities}
+ def retrieve_registration_v2_handoff(
+  self,transaction_id,worker_id,instance_id,source_ip,read_and_remove_secret
+ ):
+  expired=False
+  file_name=None
+  with self.store.transaction() as c:
+   row=c.execute(
+    "SELECT h.*,c.revoked_at,c.consumed_at,c.lifecycle_version,"
+    "c.single_use,c.capabilities_json AS credential_capabilities "
+    "FROM worker_registration_handoffs_v2 h "
+    "JOIN worker_credentials c ON c.credential_id="
+    "h.bootstrap_credential_id WHERE h.registration_transaction_id=?",
+    (transaction_id,),
+   ).fetchone()
+   expected_capabilities=json.dumps(
+    REGISTRATION_V2_CAPABILITIES,separators=(',',':')
+   )
+   if (
+    row is None or row['state']!='pending'
+    or row['worker_id']!=WORKER_ID or worker_id!=WORKER_ID
+    or row['instance_id']!=instance_id
+    or row['expected_source_ip']!=source_ip
+    or row['host']!=HOST or row['path_id']!=PATH_ID
+    or row['path_digest']!=PATH_DIGEST or row['remote']!=REMOTE
+    or row['branch']!=BRANCH or row['approved_head']!=APPROVED_HEAD
+    or row['capabilities_json']!=expected_capabilities
+    or row['credential_capabilities']!=expected_capabilities
+    or row['revoked_at'] is not None or row['consumed_at'] is not None
+    or row['lifecycle_version']!=CURRENT_LIFECYCLE_VERSION
+    or row['single_use']!=1
+   ):
+    raise error('invalid_credential')
+   try:
+    expiry=datetime.fromisoformat(row['expires_at'].replace('Z','+00:00'))
+   except (AttributeError,ValueError):
+    raise error('invalid_credential') from None
+   if expiry.tzinfo is None or expiry.astimezone(timezone.utc)<=self._now_datetime():
+    c.execute(
+     "UPDATE worker_registration_handoffs_v2 SET state='expired' "
+     "WHERE registration_transaction_id=? AND state='pending'",
+     (transaction_id,),
+    )
+    self._audit(
+     c,'registration_v2_handoff_expired',worker_id=WORKER_ID,
+     instance_id=instance_id,outcome='expired',reason_code=transaction_id,
+    )
+    expired=True
+   else:
+    file_name=row['secret_file_name']
+    changed=c.execute(
+     "UPDATE worker_registration_handoffs_v2 SET state='retrieved',"
+     "retrieved_at=? WHERE registration_transaction_id=? AND state='pending'",
+     (self.now(),transaction_id),
+    ).rowcount
+    if changed!=1:
+     raise error('invalid_credential')
+    self._audit(
+     c,'registration_v2_handoff_retrieved',worker_id=WORKER_ID,
+     instance_id=instance_id,outcome='retrieved',reason_code=transaction_id,
+    )
+  if expired:
+   raise error('invalid_credential')
+  secret=read_and_remove_secret(file_name)
+  return secret
  def seed_test_worker(self):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
   return self.provision_worker()['secret']
@@ -307,6 +420,27 @@ class WorkerControlPlaneService:
    payload=validate_codex_execute_payload(payload)
   except ValueError:
    raise error('invalid_task_payload') from None
+  expected=json.dumps(REGISTRATION_V2_CAPABILITIES,separators=(',',':'))
+  ready=self.store.conn.execute(
+   "SELECT 1 FROM worker_registration_transactions_v2 t "
+   "JOIN worker_instances i ON i.registration_id=t.registration_id "
+   "AND i.instance_id=t.instance_id AND i.worker_id=t.worker_id "
+   "JOIN worker_credentials c ON c.credential_id=t.credential_id "
+   "JOIN workers w ON w.worker_id=t.worker_id "
+   "WHERE t.worker_id=? AND t.state='confirmed' "
+   "AND t.host=? AND t.path_id=? AND t.path_digest=? AND t.remote=? "
+   "AND t.branch=? AND t.approved_head=? AND t.capabilities_json=? "
+   "AND i.status='active' AND i.access_credential_id=t.credential_id "
+   "AND c.revoked_at IS NULL AND c.expires_at>? "
+   "AND c.capabilities_json=? AND w.enabled=1 "
+   "AND w.allowed_capabilities=? LIMIT 1",
+   (
+    WORKER_ID,HOST,PATH_ID,PATH_DIGEST,REMOTE,BRANCH,APPROVED_HEAD,
+    expected,self.now(),expected,expected,
+   ),
+  ).fetchone()
+  if ready is None:
+   raise error('invalid_credential')
   return self._enqueue_task('codex.execute',payload,key,worker_id)
  def create_test_echo_task(self,payload,key):
   if not self.settings.test_mode: raise RuntimeError('test mode required')

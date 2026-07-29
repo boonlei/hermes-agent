@@ -199,3 +199,63 @@ index before recording migration metadata. An incompatible pre-existing
 table fails the transaction without a migration row. Existing v1 rows have
 no transaction row and keep their established behavior. Poll, ACK, Result,
 and `codex.execute` result contracts are unchanged.
+
+## RC1 protected commissioning procedure
+
+The server operator creates exactly one handoff. The instance UUID and
+transaction UUID must be the exact values already present in the Worker
+commissioning configuration. The expected source is the Worker machine's
+Tailnet IPv4 address. This command prints safe metadata only:
+
+```text
+python -m gateway.worker_control_plane.runtime commission provision \
+  --instance-id <canonical-uuid> \
+  --transaction-id <canonical-uuid> \
+  --expected-source-ip <worker-tailnet-ipv4> \
+  --ttl-seconds 900
+```
+
+The handoff endpoint is reachable only through the existing Tailnet HTTPS
+Serve path. It accepts one GET from the bound source machine, worker,
+instance, transaction, target identity, and ordered capability set. It is
+single-use, has no HEAD alias, returns `Cache-Control: no-store`, never logs
+the response body, and removes the server-side transfer file before success.
+Funnel must remain off.
+
+On `DESKTOP-87SSHTU`, use an elevated PowerShell session. Values below are
+safe identifiers, not credentials. The bootstrap bytes are streamed directly
+to a protected staging file and never appear in an argument or terminal:
+
+```powershell
+$credentialDir = 'C:\ProgramData\HermesWorker\credentials'
+$destination = Join-Path $credentialDir 'bootstrap.secret'
+$staging = Join-Path $credentialDir ('.bootstrap.' + [guid]::NewGuid() + '.tmp')
+if (Test-Path -LiteralPath $destination) { throw 'bootstrap destination exists' }
+New-Item -ItemType Directory -Force -Path $credentialDir | Out-Null
+icacls.exe $credentialDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)(F)' 'BUILTIN\Administrators:(OI)(CI)(F)' 'HermesWorkerSvc:(OI)(CI)(R)' | Out-Null
+icacls.exe $credentialDir /setowner 'BUILTIN\Administrators' | Out-Null
+$uri = 'https://hermes-wcp-m2b2b.tail5b5e61.ts.net/worker-control-plane/v2/registration/bootstrap?registration_transaction_id=<transaction-uuid>&worker_id=server-a-worker&instance_id=<instance-uuid>'
+try {
+  Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $staging
+  icacls.exe $staging /inheritance:r /grant:r 'SYSTEM:(F)' 'BUILTIN\Administrators:(F)' 'HermesWorkerSvc:(R)' | Out-Null
+  icacls.exe $staging /setowner 'BUILTIN\Administrators' | Out-Null
+  Move-Item -LiteralPath $staging -Destination $destination
+} catch {
+  if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging }
+  throw
+}
+C:\HermesServerWorker-deploy\.venv\Scripts\python.exe -m worker.main --register-v2-only --config C:\HermesServerWorker-deploy\config\worker.commissioning.example.json
+```
+
+Do not retry retrieval or create a second transaction after a failure.
+Inspect safe server state without reading credentials:
+
+```text
+python -m gateway.worker_control_plane.runtime commission status \
+  --transaction-id <canonical-uuid> [--task-id <canonical-uuid>]
+```
+
+The status command opens SQLite in query-only mode and reports registration,
+handoff, delivery, ACK, Result, audit, pending-task, quick-check,
+foreign-key-check, and redaction status. It never outputs a bootstrap secret,
+access credential, verifier, escrow, or Authorization value.

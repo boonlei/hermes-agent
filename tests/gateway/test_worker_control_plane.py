@@ -2057,7 +2057,12 @@ async def test_echo_only_access_cannot_poll_codex_task(control_plane):
     service, _, secret = control_plane
     worker = MockWorkerClient(control_plane[1], secret)
     assert (await worker.register())[0] == 201
-    task_id = service.enqueue_codex_execute(_codex_payload(), "codex-authz")
+    task_id = service._enqueue_task(
+        "codex.execute",
+        _codex_payload(),
+        "codex-authz",
+        "server-a-worker",
+    )
 
     status, body = await worker.poll(
         "codex-authz-poll", capabilities=["codex.execute"]

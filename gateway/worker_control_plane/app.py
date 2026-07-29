@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import os
+import stat
 import uuid
 from aiohttp import web
 
@@ -34,6 +37,90 @@ HEARTBEAT = {"worker_id", "instance_id", "registration_id", "status", "current_t
 POLL = {"worker_id", "instance_id", "registration_id", "capabilities", "max_tasks", "wait_seconds"}
 ACK = {"worker_id", "instance_id", "registration_id", "delivery_id", "accepted", "reason", "worker_time"}
 RESULT = {"worker_id", "instance_id", "registration_id", "delivery_id", "task_id", "task_type", "status", "stdout", "stderr", "exit_code", "started_at", "finished_at", "duration_ms", "result_idempotency_key", "payload_hash", "trace_id"}
+HANDOFF_QUERY = {
+    "registration_transaction_id",
+    "worker_id",
+    "instance_id",
+}
+
+
+def _verified_proxy_source(request: web.Request) -> str:
+    if request.remote not in {"127.0.0.1", "::1"}:
+        raise error("invalid_credential")
+    values = request.headers.getall("X-Forwarded-For", [])
+    if len(values) != 1 or "," in values[0]:
+        raise error("invalid_credential")
+    try:
+        address = ipaddress.ip_address(values[0])
+    except ValueError:
+        raise error("invalid_credential") from None
+    tailnet = ipaddress.ip_network("100.64.0.0/10")
+    if address.version != 4 or address not in tailnet:
+        raise error("invalid_credential")
+    return address.compressed
+
+
+def _read_and_remove_handoff_secret(
+    settings: WorkerControlPlaneSettings, file_name: str
+) -> str:
+    prefix = ".registration-v2-handoff-"
+    suffix = ".secret"
+    if (
+        not file_name.startswith(prefix)
+        or not file_name.endswith(suffix)
+        or "/" in file_name
+        or "\\" in file_name
+    ):
+        raise error("invalid_credential")
+    try:
+        uuid.UUID(file_name[len(prefix) : -len(suffix)])
+    except ValueError:
+        raise error("invalid_credential") from None
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(settings.approved_test_root, flags)
+    descriptor = -1
+    try:
+        root_info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != os.getuid()
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise error("invalid_credential")
+        descriptor = os.open(
+            file_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        opened = os.fstat(descriptor)
+        current = os.stat(file_name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+            or opened.st_size > 128
+        ):
+            raise error("invalid_credential")
+        raw = os.read(descriptor, 129)
+        try:
+            secret = raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise error("invalid_credential") from None
+        if not secret or len(raw) > 128 or not secret.isprintable():
+            raise error("invalid_credential")
+        latest = os.stat(file_name, dir_fd=root_fd, follow_symlinks=False)
+        if (latest.st_dev, latest.st_ino) != (opened.st_dev, opened.st_ino):
+            raise error("invalid_credential")
+        os.unlink(file_name, dir_fd=root_fd)
+        os.fsync(root_fd)
+        return secret
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
 
 def _token(request: web.Request, scheme: str) -> str:
     value = request.headers.get("Authorization", "")
@@ -462,6 +549,39 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
             identity["registration_id"],
         )
         return web.json_response(response)
+    async def registration_handoff(request: web.Request):
+        query = request.query
+        if (
+            set(query) != HANDOFF_QUERY
+            or any(len(query.getall(field)) != 1 for field in HANDOFF_QUERY)
+        ):
+            raise error("malformed_request")
+        try:
+            transaction_id = str(
+                uuid.UUID(query["registration_transaction_id"])
+            )
+            instance_id = str(uuid.UUID(query["instance_id"]))
+        except ValueError:
+            raise error("malformed_request") from None
+        source_ip = _verified_proxy_source(request)
+        secret = svc.retrieve_registration_v2_handoff(
+            transaction_id,
+            query["worker_id"],
+            instance_id,
+            source_ip,
+            lambda file_name: _read_and_remove_handoff_secret(
+                settings, file_name
+            ),
+        )
+        return web.Response(
+            text=secret,
+            content_type="text/plain",
+            headers={
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     @audited("heartbeat_rejected")
     async def heartbeat(request: web.Request):
         body = await _json(request, HEARTBEAT); _heartbeat(body)
@@ -497,6 +617,11 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
     app.router.add_get(
         "/worker-control-plane/v2/registration/status",
         registration_status,
+        allow_head=False,
+    )
+    app.router.add_get(
+        "/worker-control-plane/v2/registration/bootstrap",
+        registration_handoff,
         allow_head=False,
     )
     app.router.add_post("/worker/v1/heartbeat", heartbeat)
