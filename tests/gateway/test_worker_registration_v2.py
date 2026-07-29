@@ -27,11 +27,15 @@ BRANCH = "main"
 APPROVED_HEAD = "4092825b22184ad9820b4899b49fb1f833ac0b19"
 CAPABILITIES = ["system.echo", "codex.execute"]
 PATH_DIGEST = hashlib.sha256(
+    b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker-deploy"
+).hexdigest()
+OLD_PATH_DIGEST = hashlib.sha256(
     b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker"
 ).hexdigest()
 REGISTER_PATH = "/worker-control-plane/v2/register"
 RECOVER_PATH = "/worker-control-plane/v2/registration/recover"
 CONFIRM_PATH = "/worker-control-plane/v2/registration/confirm"
+STATUS_PATH = "/worker-control-plane/v2/registration/status"
 
 
 class MutableClock:
@@ -155,6 +159,71 @@ async def confirm_v2(client, token, body):
         json=body,
     )
     return response.status, await response.json()
+
+
+async def registration_status(
+    client,
+    token,
+    instance_id,
+    registration_id,
+):
+    response = await client.get(
+        STATUS_PATH,
+        headers={"Authorization": f"Bearer {token}"},
+        params={
+            "instance_id": instance_id,
+            "registration_id": registration_id,
+        },
+    )
+    return response.status, await response.json()
+
+
+async def confirmed_registration(
+    client,
+    provisioned,
+    *,
+    instance_id=None,
+):
+    instance_id = instance_id or str(uuid.uuid4())
+    transaction_id = str(uuid.uuid4())
+    status, issued = await register_v2(
+        client,
+        provisioned["secret"],
+        register_body(instance_id, transaction_id),
+    )
+    assert status == 201
+    confirmation = confirmation_body(
+        instance_id,
+        transaction_id,
+        issued["registration_id"],
+        issued["credential_id"],
+        issued["access_token"],
+    )
+    status, confirmed = await confirm_v2(
+        client,
+        issued["access_token"],
+        confirmation,
+    )
+    assert status == 200
+    return instance_id, transaction_id, issued, confirmed
+
+
+def database_snapshot(connection):
+    tables = [
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "ORDER BY name"
+        )
+        if not row[0].startswith("sqlite_")
+    ]
+    return {
+        table: [
+            tuple(row)
+            for row in connection.execute(f"SELECT * FROM {table}")
+        ]
+        for table in tables
+    }
 
 
 @pytest.mark.asyncio
@@ -334,6 +403,126 @@ async def test_register_v2_rejects_wrong_fixed_identity(
 
     assert status == 422
     assert response["error"]["code"] == "invalid_target_identity"
+
+
+@pytest.mark.asyncio
+async def test_registration_v2_uses_only_production_deploy_path_identity(
+    registration_v2,
+):
+    _, client, provisioned, _, _ = registration_v2
+    assert PATH_DIGEST == (
+        "e8f0e3d56567d83c62ce7c3cc72e8418"
+        "8ee217660680b153e41f25e97c546a95"
+    )
+    assert OLD_PATH_DIGEST == (
+        "cb9663820ff1e74f243669708da5eac8d"
+        "da3cf02654f212ad7fef2ffc12d5c05"
+    )
+
+    status, body = await register_v2(
+        client,
+        provisioned["secret"],
+        register_body(str(uuid.uuid4()), str(uuid.uuid4())),
+    )
+    assert status == 201
+    assert body["target_identity"]["path_digest"] == PATH_DIGEST
+
+    status, body = await register_v2(
+        client,
+        provisioned["secret"],
+        register_body(
+            str(uuid.uuid4()),
+            str(uuid.uuid4()),
+            target_identity=target_identity(path_digest=OLD_PATH_DIGEST),
+        ),
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_target_identity"
+
+
+@pytest.mark.asyncio
+async def test_register_recover_and_confirm_bind_corrected_target_identity(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id = str(uuid.uuid4())
+    transaction_id = str(uuid.uuid4())
+    status, issued = await register_v2(
+        client,
+        provisioned["secret"],
+        register_body(instance_id, transaction_id),
+    )
+    assert status == 201
+    status, recovered = await recover_v2(
+        client,
+        provisioned["secret"],
+        recovery_body(instance_id, transaction_id),
+    )
+    assert status == 200
+    assert recovered == issued
+
+    status, body = await recover_v2(
+        client,
+        provisioned["secret"],
+        recovery_body(
+            instance_id,
+            transaction_id,
+            target_identity=target_identity(
+                path_digest=OLD_PATH_DIGEST
+            ),
+        ),
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_target_identity"
+
+    confirmation = confirmation_body(
+        instance_id,
+        transaction_id,
+        issued["registration_id"],
+        issued["credential_id"],
+        issued["access_token"],
+    )
+    old_confirmation = dict(confirmation)
+    old_confirmation["target_identity"] = target_identity(
+        path_digest=OLD_PATH_DIGEST
+    )
+    unsigned = {
+        key: value
+        for key, value in old_confirmation.items()
+        if key != "installation_proof"
+    }
+    old_confirmation["installation_proof"] = hmac.new(
+        issued["access_token"].encode("utf-8"),
+        json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    status, body = await confirm_v2(
+        client,
+        issued["access_token"],
+        old_confirmation,
+    )
+    assert status == 422
+    assert body["error"]["code"] == "invalid_target_identity"
+
+    status, confirmed = await confirm_v2(
+        client,
+        issued["access_token"],
+        confirmation,
+    )
+    assert status == 200
+    assert confirmed["state"] == "confirmed"
+    transaction = service.store.conn.execute(
+        "SELECT path_digest,state FROM "
+        "worker_registration_transactions_v2 "
+        "WHERE registration_transaction_id=?",
+        (transaction_id,),
+    ).fetchone()
+    assert tuple(transaction) == (PATH_DIGEST, "confirmed")
 
 
 @pytest.mark.asyncio
@@ -752,6 +941,272 @@ async def test_confirm_activates_credential_and_retires_bootstrap(
         },
     )
     assert poll.status == 204
+
+
+@pytest.mark.asyncio
+async def test_registration_status_authenticates_without_protocol_mutation(
+    registration_v2,
+    caplog,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+    caplog.clear()
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        instance_id,
+        issued["registration_id"],
+    )
+
+    assert status == 200
+    assert body == {
+        "protocol_version": 2,
+        "worker_id": "server-a-worker",
+        "instance_id": instance_id,
+        "registration_id": issued["registration_id"],
+        "credential_id": issued["credential_id"],
+        "state": "confirmed",
+        "capabilities": CAPABILITIES,
+        "expires_at": issued["expires_at"],
+    }
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+    assert connection.execute(
+        "SELECT count(*) FROM worker_tasks"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT count(*) FROM worker_deliveries"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT count(*) FROM worker_results"
+    ).fetchone()[0] == 0
+    serialized = json.dumps(body, sort_keys=True)
+    assert issued["access_token"] not in serialized
+    assert provisioned["secret"] not in serialized
+    assert issued["access_token"] not in caplog.text
+    assert provisioned["secret"] not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_registration_status_requires_bearer_and_exact_context(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+
+    response = await client.get(
+        STATUS_PATH,
+        params={
+            "instance_id": instance_id,
+            "registration_id": issued["registration_id"],
+        },
+    )
+    assert response.status == 401
+    assert (await response.json())["error"]["code"] == "invalid_credential"
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        str(uuid.uuid4()),
+        issued["registration_id"],
+    )
+    assert status == 403
+    assert body["error"]["code"] == "worker_not_authorized"
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        instance_id,
+        str(uuid.uuid4()),
+    )
+    assert status == 409
+    assert body["error"]["code"] == "state_conflict"
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+
+
+@pytest.mark.asyncio
+async def test_registration_status_request_is_closed_and_get_only(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+    headers = {"Authorization": f"Bearer {issued['access_token']}"}
+    params = {
+        "instance_id": instance_id,
+        "registration_id": issued["registration_id"],
+    }
+
+    response = await client.get(
+        STATUS_PATH,
+        headers=headers,
+        params={**params, "unexpected": "value"},
+    )
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] == "malformed_request"
+
+    response = await client.get(
+        STATUS_PATH,
+        headers=headers,
+        params=[
+            ("instance_id", instance_id),
+            ("instance_id", instance_id),
+            ("registration_id", issued["registration_id"]),
+        ],
+    )
+    assert response.status == 400
+    assert (await response.json())["error"]["code"] == "malformed_request"
+
+    response = await client.head(
+        STATUS_PATH,
+        headers=headers,
+        params=params,
+    )
+    assert response.status == 405
+    assert response.headers["Allow"] == "GET"
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+
+
+@pytest.mark.asyncio
+async def test_registration_status_rejects_noncanonical_capability_set_read_only(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    connection = service.store.conn
+    connection.execute(
+        "UPDATE worker_credentials SET capabilities_json=? "
+        "WHERE credential_id=?",
+        (json.dumps(["system.echo"]), issued["credential_id"]),
+    )
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        instance_id,
+        issued["registration_id"],
+    )
+
+    assert status == 401
+    assert body["error"]["code"] == "invalid_credential"
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+
+
+@pytest.mark.asyncio
+async def test_registration_status_rejects_expired_credential_read_only(
+    registration_v2,
+):
+    service, client, provisioned, clock, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    clock.advance(service.settings.token_ttl_seconds + 1)
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        instance_id,
+        issued["registration_id"],
+    )
+
+    assert status == 401
+    assert body["error"]["code"] == "invalid_credential"
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+
+
+@pytest.mark.asyncio
+async def test_registration_status_rejects_revoked_credential_read_only(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, issued, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    service.revoke_registration(
+        "server-a-worker",
+        instance_id,
+        issued["registration_id"],
+    )
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+
+    status, body = await registration_status(
+        client,
+        issued["access_token"],
+        instance_id,
+        issued["registration_id"],
+    )
+
+    assert status == 403
+    assert body["error"]["code"] == "worker_revoked"
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
+
+
+@pytest.mark.asyncio
+async def test_registration_status_rejects_superseded_credential_read_only(
+    registration_v2,
+):
+    service, client, provisioned, _, _ = registration_v2
+    instance_id, _, first, _ = await confirmed_registration(
+        client,
+        provisioned,
+    )
+    next_bootstrap = service.provision_worker(capabilities=CAPABILITIES)
+    _, _, second, _ = await confirmed_registration(
+        client,
+        next_bootstrap,
+        instance_id=instance_id,
+    )
+    connection = service.store.conn
+    before = database_snapshot(connection)
+    changes_before = connection.total_changes
+
+    status, body = await registration_status(
+        client,
+        first["access_token"],
+        instance_id,
+        first["registration_id"],
+    )
+
+    assert status == 401
+    assert body["error"]["code"] == "invalid_credential"
+    assert second["registration_id"] == first["registration_id"]
+    assert connection.total_changes == changes_before
+    assert database_snapshot(connection) == before
 
 
 @pytest.mark.asyncio

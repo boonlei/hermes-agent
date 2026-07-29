@@ -23,7 +23,7 @@ PATH_ID = "hermes-server-worker"
 REMOTE = "https://github.com/boonlei/HermesServerWorker.git"
 BRANCH = "main"
 APPROVED_HEAD = "4092825b22184ad9820b4899b49fb1f833ac0b19"
-PATH_DIGEST = "cb9663820ff1e74f243669708da5eac8dda3cf02654f212ad7fef2ffc12d5c05"
+PATH_DIGEST = "e8f0e3d56567d83c62ce7c3cc72e84188ee217660680b153e41f25e97c546a95"
 CAPABILITIES = ["system.echo", "codex.execute"]
 PENDING_STATE = "issued_pending_confirmation"
 TERMINAL_STATES = {"confirmed", "superseded", "revoked", "expired"}
@@ -59,6 +59,7 @@ CONFIRM_FIELDS = {
     "installation_proof",
 }
 TARGET_FIELDS = {"path_digest", "remote", "branch", "approved_head"}
+STATUS_FIELDS = {"instance_id", "registration_id"}
 LOWER_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -163,6 +164,18 @@ def validate_confirmation_request(data: object) -> dict:
     if not isinstance(proof, str) or not LOWER_HEX_64.fullmatch(proof):
         raise ValueError("invalid_credential")
     return value
+
+
+def validate_status_request(data: object) -> dict[str, str]:
+    if not isinstance(data, dict) or set(data) != STATUS_FIELDS:
+        raise ValueError("malformed_request")
+    return {
+        "instance_id": _canonical_uuid(data["instance_id"], "instance_id"),
+        "registration_id": _canonical_uuid(
+            data["registration_id"],
+            "registration_id",
+        ),
+    }
 
 
 def identity_aad(

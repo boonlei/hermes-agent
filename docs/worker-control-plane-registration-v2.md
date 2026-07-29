@@ -24,11 +24,13 @@ The v2 contract accepts exactly:
 - capabilities, in canonical order:
   `["system.echo","codex.execute"]`
 - path digest
-  `cb9663820ff1e74f243669708da5eac8dda3cf02654f212ad7fef2ffc12d5c05`
+  `e8f0e3d56567d83c62ce7c3cc72e84188ee217660680b153e41f25e97c546a95`
 
 The digest is SHA-256 over the UTF-8 canonical identity
-`windows-path-v1|desktop-87sshtu|c:\hermesserverworker`. It binds the approved
-fixed Worker checkout without sending the raw path over the wire.
+`windows-path-v1|desktop-87sshtu|c:\hermesserverworker-deploy`. It binds the
+approved production Worker checkout without sending the raw path over the
+wire. The former dirty-checkout identity at `c:\hermesserverworker` has no
+alias or equivalence and is rejected by Register, Recover, and Confirm.
 
 ## Register v2
 
@@ -149,6 +151,21 @@ On confirmation, one `BEGIN IMMEDIATE` transaction:
 
 Repeated exact confirmation is idempotent. No confirmed response returns an
 access token.
+
+## Authentication-only status
+
+`GET /worker-control-plane/v2/registration/status` requires
+`Authorization: Bearer <confirmed-access-token>` and exactly two query
+parameters: canonical lowercase `instance_id` and `registration_id` UUIDs.
+The token, registration, instance, confirmed transaction, expiry, and exact
+`["system.echo","codex.execute"]` capability set must all match.
+
+The closed JSON response contains only `protocol_version`, `worker_id`,
+`instance_id`, `registration_id`, `credential_id`, `state`, `capabilities`,
+and `expires_at`. It never returns token, verifier, escrow, bootstrap, or
+secret material. The endpoint performs only bounded SQLite reads: it does not
+open a write transaction, write audit records, Poll, claim or create a task,
+create a delivery, ACK, submit a Result, or execute Codex.
 
 ## States and transitions
 
