@@ -16,15 +16,19 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.worker_control_plane.app import create_worker_control_plane_app
 from gateway.worker_control_plane.config import WorkerControlPlaneSettings
+from gateway.worker_control_plane.errors import WorkerControlPlaneError
 from gateway.worker_control_plane.service import WorkerControlPlaneService
-from tests.gateway.worker_control_plane_helpers import MockWorkerClient
+from tests.gateway.worker_control_plane_helpers import (
+    MockWorkerClient,
+    authorize_test_handoff,
+)
 
 
 HOST = "DESKTOP-87SSHTU"
 PATH_ID = "hermes-server-worker"
 REMOTE = "https://github.com/boonlei/HermesServerWorker.git"
 BRANCH = "main"
-APPROVED_HEAD = "dbdc56792d1926fb19b7e22e1a282fd96a82cd76"
+APPROVED_HEAD = "ac8989ae9012ae70eb5f12d1a78260471b0a9728"
 CAPABILITIES = ["system.echo", "codex.execute"]
 PATH_DIGEST = hashlib.sha256(
     b"windows-path-v1|desktop-87sshtu|c:\\hermesserverworker-deploy"
@@ -36,6 +40,7 @@ REGISTER_PATH = "/worker-control-plane/v2/register"
 RECOVER_PATH = "/worker-control-plane/v2/registration/recover"
 CONFIRM_PATH = "/worker-control-plane/v2/registration/confirm"
 STATUS_PATH = "/worker-control-plane/v2/registration/status"
+_TEST_SERVICES = {}
 
 
 class MutableClock:
@@ -127,14 +132,45 @@ async def registration_v2(tmp_path):
         TestServer(create_worker_control_plane_app(settings, service))
     )
     await client.start_server()
+    _TEST_SERVICES[id(client)] = service
     try:
         yield service, client, provisioned, clock, settings
     finally:
+        _TEST_SERVICES.pop(id(client), None)
         await client.close()
         service.close()
 
 
 async def register_v2(client, secret, body):
+    service = _TEST_SERVICES.get(id(client))
+    if (
+        service is not None
+        and isinstance(body, dict)
+        and body.get("protocol_version") == 2
+        and isinstance(body.get("instance_id"), str)
+        and isinstance(body.get("registration_transaction_id"), str)
+        and body.get("host") == HOST
+        and body.get("path_id") == PATH_ID
+        and body.get("capabilities") == CAPABILITIES
+        and body.get("target_identity") == target_identity()
+        and service.store.conn.execute(
+            "SELECT 1 FROM worker_registration_handoffs_v2 "
+            "WHERE registration_transaction_id=?",
+            (body["registration_transaction_id"],),
+        ).fetchone()
+        is None
+    ):
+        try:
+            authorize_test_handoff(
+                service,
+                secret,
+                body["instance_id"],
+                body["registration_transaction_id"],
+            )
+        except sqlite3.IntegrityError:
+            # A bootstrap is bound to exactly one server-authorized handoff.
+            # Let the request exercise the production fail-closed path.
+            pass
     response = await client.post(
         REGISTER_PATH,
         headers={"Authorization": f"Worker-Bootstrap {secret}"},
@@ -575,9 +611,9 @@ async def test_same_transaction_retry_and_recovery_return_same_token(
     )
 
     assert first_status == 201
-    assert retry_status == 200
+    assert retry_status == 401
     assert recover_status == 200
-    assert retry == first
+    assert retry["error"]["code"] == "invalid_credential"
     assert recovered == first
     assert service.store.conn.execute(
         "SELECT count(*) FROM worker_registration_transactions_v2"
@@ -607,8 +643,8 @@ async def test_transaction_reuse_with_changed_request_is_conflict(
         client, provisioned["secret"], changed
     )
 
-    assert status == 409
-    assert body["error"]["code"] == "idempotency_conflict"
+    assert status == 401
+    assert body["error"]["code"] == "invalid_credential"
 
 
 @pytest.mark.asyncio
@@ -767,7 +803,7 @@ async def test_health_does_not_reap_expired_pending_transaction(
         issued["credential_id"],
     )
     assert before["bootstrap"] == (None, None)
-    assert before["audit_count"] == 2
+    assert before["audit_count"] == 3
     changes_before = connection.total_changes
     statements = []
     connection.set_trace_callback(statements.append)
@@ -804,7 +840,7 @@ async def test_health_does_not_reap_expired_pending_transaction(
 
 
 @pytest.mark.asyncio
-async def test_pending_expiry_allows_same_bootstrap_until_its_own_expiry(
+async def test_pending_expiry_does_not_authorize_a_second_transaction(
     registration_v2,
 ):
     service, client, provisioned, clock, _ = registration_v2
@@ -824,15 +860,22 @@ async def test_pending_expiry_allows_same_bootstrap_until_its_own_expiry(
         register_body(instance_id, second_transaction_id),
     )
 
-    assert status == 201
-    assert second["credential_id"] != first["credential_id"]
+    assert status == 401
+    assert second["error"]["code"] == "invalid_credential"
     first_state = service.store.conn.execute(
         "SELECT state,escrow_ciphertext FROM "
         "worker_registration_transactions_v2 "
         "WHERE registration_transaction_id=?",
         (first_transaction_id,),
     ).fetchone()
-    assert tuple(first_state) == ("expired", None)
+    assert first_state["state"] == "issued_pending_confirmation"
+    assert first_state[1] is not None
+    assert service.store.conn.execute(
+        "SELECT count(*) FROM worker_registration_transactions_v2"
+    ).fetchone()[0] == 1
+    assert service.store.conn.execute(
+        "SELECT count(*) FROM worker_credentials WHERE kind='access'"
+    ).fetchone()[0] == 1
     bootstrap = service.store.conn.execute(
         "SELECT consumed_at,revoked_at FROM worker_credentials "
         "WHERE credential_id=?",
@@ -1371,6 +1414,13 @@ def test_registration_v2_transaction_rollback_preserves_bootstrap(
     )
     service = WorkerControlPlaneService(settings, clock=MutableClock())
     provisioned = service.provision_worker(capabilities=CAPABILITIES)
+    body = register_body(str(uuid.uuid4()), str(uuid.uuid4()))
+    authorize_test_handoff(
+        service,
+        provisioned["secret"],
+        body["instance_id"],
+        body["registration_transaction_id"],
+    )
     original_audit = service._audit
 
     def fail_after_writes(connection, event, **fields):
@@ -1381,7 +1431,7 @@ def test_registration_v2_transaction_rollback_preserves_bootstrap(
     monkeypatch.setattr(service, "_audit", fail_after_writes)
     with pytest.raises(RuntimeError, match="forced_transaction_rollback"):
         service.register_worker_v2(
-            register_body(str(uuid.uuid4()), str(uuid.uuid4())),
+            body,
             provisioned["secret"],
         )
 
@@ -1418,17 +1468,31 @@ def test_concurrent_same_transaction_serializes_to_one_credential(tmp_path):
         settings, clock=MutableClock()
     )
     body = register_body(str(uuid.uuid4()), str(uuid.uuid4()))
+    authorize_test_handoff(
+        first_service,
+        provisioned["secret"],
+        body["instance_id"],
+        body["registration_transaction_id"],
+    )
 
     def issue(service):
-        return service.register_worker_v2(body, provisioned["secret"])
+        try:
+            return ("success", service.register_worker_v2(
+                body, provisioned["secret"]
+            ))
+        except WorkerControlPlaneError as exc:
+            return ("error", exc)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
             outcomes = list(
                 executor.map(issue, (first_service, second_service))
             )
-        assert {status for status, _ in outcomes} == {200, 201}
-        assert outcomes[0][1] == outcomes[1][1]
+        assert [kind for kind, _ in outcomes].count("success") == 1
+        assert [kind for kind, _ in outcomes].count("error") == 1
+        loser = next(value for kind, value in outcomes if kind == "error")
+        assert loser.status == 401
+        assert loser.code == "invalid_credential"
         assert first_service.store.conn.execute(
             "SELECT count(*) FROM worker_registration_transactions_v2"
         ).fetchone()[0] == 1
@@ -1447,6 +1511,12 @@ async def test_revoking_bootstrap_revokes_pending_transaction(
     service, client, provisioned, _, _ = registration_v2
     instance_id = str(uuid.uuid4())
     transaction_id = str(uuid.uuid4())
+    authorize_test_handoff(
+        service,
+        provisioned["secret"],
+        instance_id,
+        transaction_id,
+    )
     _, issued = await register_v2(
         client,
         provisioned["secret"],
@@ -1493,11 +1563,18 @@ async def test_pending_recovery_survives_server_restart(tmp_path):
     await client.start_server()
     instance_id = str(uuid.uuid4())
     transaction_id = str(uuid.uuid4())
-    _, issued = await register_v2(
+    authorize_test_handoff(
+        service,
+        provisioned["secret"],
+        instance_id,
+        transaction_id,
+    )
+    status, issued = await register_v2(
         client,
         provisioned["secret"],
         register_body(instance_id, transaction_id),
     )
+    assert status == 201
     await client.close()
     service.close()
 
@@ -1528,8 +1605,15 @@ def test_restart_reaps_expired_pending_without_recovery_request(tmp_path):
     service = WorkerControlPlaneService(settings, clock=clock)
     provisioned = service.provision_worker(capabilities=CAPABILITIES)
     transaction_id = str(uuid.uuid4())
+    body = register_body(str(uuid.uuid4()), transaction_id)
+    authorize_test_handoff(
+        service,
+        provisioned["secret"],
+        body["instance_id"],
+        transaction_id,
+    )
     _, issued = service.register_worker_v2(
-        register_body(str(uuid.uuid4()), transaction_id),
+        body,
         provisioned["secret"],
     )
     clock.advance(service.settings.token_ttl_seconds + 1)

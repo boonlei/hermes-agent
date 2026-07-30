@@ -22,7 +22,7 @@ HOST = "DESKTOP-87SSHTU"
 PATH_ID = "hermes-server-worker"
 REMOTE = "https://github.com/boonlei/HermesServerWorker.git"
 BRANCH = "main"
-APPROVED_HEAD = "dbdc56792d1926fb19b7e22e1a282fd96a82cd76"
+APPROVED_HEAD = "ac8989ae9012ae70eb5f12d1a78260471b0a9728"
 PATH_DIGEST = "e8f0e3d56567d83c62ce7c3cc72e84188ee217660680b153e41f25e97c546a95"
 CAPABILITIES = ["system.echo", "codex.execute"]
 PENDING_STATE = "issued_pending_confirmation"
@@ -30,6 +30,8 @@ TERMINAL_STATES = {"confirmed", "superseded", "revoked", "expired"}
 ALL_STATES = {PENDING_STATE, *TERMINAL_STATES}
 MAX_RECOVERIES = 5
 WRAP_INFO = b"hermes-wcp-registration-v2-token-wrap"
+HANDOFF_MAC_CONTEXT = b"hermes-wcp-registration-v2-handoff-v1\x00"
+BOOTSTRAP_BINDING_CONTEXT = b"HermesWorker/bootstrap-binding/v1\x00"
 
 REGISTER_FIELDS = {
     "protocol_version",
@@ -81,6 +83,58 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def request_hash(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def bootstrap_binding_id(secret: str) -> str:
+    if (
+        not isinstance(secret, str)
+        or not secret
+        or len(secret.encode("utf-8")) > 4096
+    ):
+        raise ValueError("invalid_credential")
+    return hashlib.sha256(
+        BOOTSTRAP_BINDING_CONTEXT + secret.encode("utf-8")
+    ).hexdigest()
+
+
+def build_handoff_envelope(row: object, secret: str) -> dict[str, object]:
+    metadata = {
+        "schema_version": 1,
+        "protocol_version": 2,
+        "registration_transaction_id": row[
+            "registration_transaction_id"
+        ],
+        "worker_id": row["worker_id"],
+        "instance_id": row["instance_id"],
+        "bootstrap_credential_id": row["bootstrap_credential_id"],
+        "bootstrap_binding_id": row["bootstrap_binding_id"],
+        "host": row["host"],
+        "path_id": row["path_id"],
+        "target_identity": {
+            "path_digest": row["path_digest"],
+            "remote": row["remote"],
+            "branch": row["branch"],
+            "approved_head": row["approved_head"],
+        },
+        "capabilities": json.loads(row["capabilities_json"]),
+        "issued_at": row["issued_at"],
+        "expires_at": row["expires_at"],
+    }
+    if not hmac.compare_digest(
+        metadata["bootstrap_binding_id"],
+        bootstrap_binding_id(secret),
+    ):
+        raise ValueError("invalid_credential")
+    tag = hmac.new(
+        secret.encode("utf-8"),
+        HANDOFF_MAC_CONTEXT + canonical_json_bytes(metadata),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        **metadata,
+        "bootstrap_secret": secret,
+        "authentication_tag": tag,
+    }
 
 
 def _bounded_text(value: object, field: str) -> str:
