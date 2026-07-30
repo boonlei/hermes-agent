@@ -20,7 +20,7 @@ The v2 contract accepts exactly:
 - path ID: `hermes-server-worker`
 - remote: `https://github.com/boonlei/HermesServerWorker.git`
 - branch: `main`
-- approved head: `4092825b22184ad9820b4899b49fb1f833ac0b19`
+- approved head: `ac8989ae9012ae70eb5f12d1a78260471b0a9728`
 - capabilities, in canonical order:
   `["system.echo","codex.execute"]`
 - path digest
@@ -57,7 +57,7 @@ The v2 request is:
     "path_digest": "<lowercase sha256>",
     "remote": "https://github.com/boonlei/HermesServerWorker.git",
     "branch": "main",
-    "approved_head": "4092825b22184ad9820b4899b49fb1f833ac0b19"
+    "approved_head": "ac8989ae9012ae70eb5f12d1a78260471b0a9728"
   },
   "registration_transaction_id": "<uuid>"
 }
@@ -114,7 +114,7 @@ Its closed request contains:
     "path_digest": "<lowercase sha256>",
     "remote": "https://github.com/boonlei/HermesServerWorker.git",
     "branch": "main",
-    "approved_head": "4092825b22184ad9820b4899b49fb1f833ac0b19"
+    "approved_head": "ac8989ae9012ae70eb5f12d1a78260471b0a9728"
   }
 }
 ```
@@ -264,3 +264,55 @@ The status command opens SQLite in query-only mode and reports registration,
 handoff, delivery, ACK, Result, audit, pending-task, quick-check,
 foreign-key-check, and redaction status. It never outputs a bootstrap secret,
 access credential, verifier, escrow, or Authorization value.
+
+## Expired orphan handoff lifecycle
+
+An operator may terminalize one expired, unconsumed handoff that never
+created a Registration-v2 transaction. The command requires all four exact
+identifiers and has no worker-wide or wildcard mode:
+
+```text
+python -m gateway.worker_control_plane.runtime commission handoff expire \
+  --worker-id server-a-worker \
+  --instance-id <canonical-uuid> \
+  --transaction-id <canonical-uuid> \
+  --credential-id <canonical-uuid> \
+  --dry-run \
+  --output json
+```
+
+Dry-run is query-only and validates the handoff, bootstrap credential,
+transaction absence, task/delivery absence, fixed target identity, artifact
+identity, expiry, ownership, permissions, link count, and open-file state.
+Use `--output text` for the same safe metadata as a readable summary. Neither
+format returns secret material or a protected artifact name.
+
+Only after an eligible dry-run, repeat the same exact command with
+`--execute` in place of `--dry-run`. Execute revalidates under
+`BEGIN IMMEDIATE`, uses an atomic no-replace move to take the protected file
+away from its retrieval name, transitions the handoff to `expired`, revokes
+the exact bootstrap credential, and records redacted lifecycle audits. A
+database or audit failure restores the file with the same no-replace guard
+and rolls back both rows. A hard interruption after staging and before the
+database commit is recognized on the next exact dry-run and can be resumed
+without a manual file or database change. After commit, the staged file is
+identity-checked, overwritten without reading its contents, truncated to
+zero, fsynced, and recorded in a redacted identity-pinned sanitization audit.
+Only then is the empty staged inode unlinked and the directory fsynced,
+followed by a separate redacted artifact-deletion audit. The sanitization
+audit lets an exact retry safely finish directory durability or deletion
+auditing after a hard interruption; path absence without that proof fails
+closed.
+
+If post-commit deletion or its audit fails, the command reports
+`cleanup_required`. Do not provision another handoff until an exact replay of
+the same `--execute` command reports `completed`. A moved or otherwise
+ambiguous artifact is audited and cannot later be mistaken for a deletion.
+Exact completed replays are idempotent only when both exact operator
+lifecycle audits prove their provenance; unrelated already-terminal states
+fail closed. Changed worker, instance, transaction, or credential identifiers
+also fail closed.
+
+Both output modes return a bounded safe rejection report for an ineligible or
+ambiguous object. Eligible/completed exits with status 0, a rejected operation
+exits nonzero, and `cleanup_required` has a distinct nonzero exit status.
