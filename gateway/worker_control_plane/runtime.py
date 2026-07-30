@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import hashlib
 import ipaddress
 import json
@@ -24,6 +25,10 @@ from aiohttp import web
 from .app import create_worker_control_plane_app
 from .auth import verify_bootstrap
 from .config import PILOT_DATA_DIRECTORY, WorkerControlPlaneSettings
+from .handoff_lifecycle import (
+    expire_expired_orphan_handoff,
+    inspect_expired_orphan_handoff,
+)
 from .models import (
     CODEX_EXECUTE_MODE,
     CODEX_EXECUTE_PATH_ID,
@@ -574,6 +579,52 @@ def commissioning_postcheck(
         connection.close()
 
 
+def _is_inaccessible_session_helper(process: Path) -> bool:
+    try:
+        process_name = (process / "comm").read_text(
+            encoding="utf-8"
+        ).strip()
+        command_line = (process / "cmdline").read_bytes()
+        cgroup = (process / "cgroup").read_text(encoding="utf-8").strip()
+        stat_fields = (process / "stat").read_text(
+            encoding="utf-8"
+        ).rsplit(")", 1)[1].split()
+        parent_pid = int(stat_fields[1])
+    except (FileNotFoundError, PermissionError, ValueError):
+        return False
+    expected_cgroup = (
+        f"0::/user.slice/user-{os.getuid()}.slice/"
+        f"user@{os.getuid()}.service/init.scope"
+    )
+    if cgroup != expected_cgroup:
+        return False
+    if (
+        process_name == "systemd"
+        and command_line
+        == b"/usr/lib/systemd/systemd\x00--user\x00"
+        and parent_pid == 1
+    ):
+        return True
+    if (
+        process_name != "(sd-pam)"
+        or command_line != b"(sd-pam)\x00"
+        or parent_pid <= 1
+    ):
+        return False
+    parent = Path("/proc") / str(parent_pid)
+    try:
+        return (
+            (parent / "comm").read_text(encoding="utf-8").strip()
+            == "systemd"
+            and (parent / "cmdline").read_bytes()
+            == b"/usr/lib/systemd/systemd\x00--user\x00"
+            and (parent / "cgroup").read_text(encoding="utf-8").strip()
+            == expected_cgroup
+        )
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
 def _process_has_open_inode(device: int, inode: int) -> bool:
     for process in Path("/proc").iterdir():
         if not process.name.isdigit():
@@ -591,15 +642,510 @@ def _process_has_open_inode(device: int, inode: int) -> bool:
         except FileNotFoundError:
             continue
         except PermissionError:
-            continue
+            if _is_inaccessible_session_helper(process):
+                continue
+            raise ValueError(
+                "handoff artifact open-file ownership is indeterminate"
+            ) from None
         for descriptor in descriptors:
             try:
-                info = descriptor.stat()
-            except (FileNotFoundError, PermissionError):
+                target = os.readlink(descriptor)
+            except FileNotFoundError:
                 continue
+            except PermissionError:
+                if _is_inaccessible_session_helper(process):
+                    break
+                raise ValueError(
+                    "handoff artifact open-file ownership is indeterminate"
+                ) from None
+            if not target.startswith("/"):
+                continue
+            try:
+                info = descriptor.stat()
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                raise ValueError(
+                    "handoff artifact open-file ownership is indeterminate"
+                ) from None
             if (info.st_dev, info.st_ino) == (device, inode):
                 return True
     return False
+
+
+def _rename_noreplace(
+    source: str,
+    destination: str,
+    *,
+    source_dir_fd: int,
+    destination_dir_fd: int,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic no-replace rename is unavailable")
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_dir_fd,
+        os.fsencode(source),
+        destination_dir_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _open_exact_handoff_artifact(
+    root_fd: int,
+    file_name: str,
+    *,
+    allow_empty: bool = False,
+    writable: bool = False,
+) -> tuple[int, dict[str, object]]:
+    descriptor = os.open(
+        file_name,
+        (os.O_RDWR if writable else os.O_RDONLY)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=root_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(file_name, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or not (
+                0 <= opened.st_size <= 128
+                if allow_empty
+                else 1 <= opened.st_size <= 128
+            )
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("handoff artifact identity is unsafe")
+        if _process_has_open_inode(opened.st_dev, opened.st_ino):
+            raise ValueError("handoff artifact is open by another process")
+        return descriptor, {
+            "present": True,
+            "owner_uid": opened.st_uid,
+            "mode": f"{stat.S_IMODE(opened.st_mode):04o}",
+            "link_count": opened.st_nlink,
+            "size": opened.st_size,
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "open_by_other_process": False,
+        }
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _inspect_exact_handoff_artifact(
+    root_fd: int, file_name: str, *, allow_empty: bool = False
+) -> dict[str, object]:
+    descriptor, evidence = _open_exact_handoff_artifact(
+        root_fd, file_name, allow_empty=allow_empty
+    )
+    os.close(descriptor)
+    return evidence
+
+
+def _prepare_expired_handoff_artifact(
+    root_fd: int,
+    root: Path,
+    file_name: str,
+    already_terminal: bool,
+    sanitized_audited: bool,
+    sanitized_device: int | None,
+    sanitized_inode: int | None,
+):
+    _verify_root_identity(root_fd, root)
+    staged_name = f"{file_name}.expired"
+    source_exists = _credential_destination_exists(root_fd, file_name)
+    staged_exists = _credential_destination_exists(root_fd, staged_name)
+
+    if already_terminal:
+        if source_exists:
+            raise ValueError(
+                "terminal handoff artifact remains retrievable"
+            )
+        if not staged_exists:
+            if not sanitized_audited:
+                raise ValueError(
+                    "terminal handoff artifact absence is unproven"
+                )
+            if sanitized_device is None or sanitized_inode is None:
+                raise ValueError("sanitized artifact identity is missing")
+
+            def sanitize_absent() -> dict[str, object]:
+                return {
+                    "sanitized": True,
+                    "device": sanitized_device,
+                    "inode": sanitized_inode,
+                    "already_absent": True,
+                }
+
+            def finalize_absent() -> dict[str, object]:
+                os.fsync(root_fd)
+                return {"deleted": True, "already_absent": True}
+
+            return (
+                None,
+                sanitize_absent,
+                finalize_absent,
+                {"present": False, "staged": False},
+            )
+        descriptor, evidence = _open_exact_handoff_artifact(
+            root_fd, staged_name, allow_empty=True, writable=True
+        )
+        if sanitized_audited and (
+            evidence["size"] != 0
+            or evidence["device"] != sanitized_device
+            or evidence["inode"] != sanitized_inode
+        ):
+            os.close(descriptor)
+            raise ValueError("sanitized artifact identity changed")
+        evidence["staged"] = True
+        evidence["recovery_staged"] = False
+    else:
+        if source_exists and staged_exists:
+            raise ValueError("handoff artifact staging state is ambiguous")
+        if not source_exists and not staged_exists:
+            raise ValueError("handoff artifact is missing")
+        selected_name = staged_name if staged_exists else file_name
+        descriptor, evidence = _open_exact_handoff_artifact(
+            root_fd, selected_name, writable=True
+        )
+        evidence["staged"] = True
+        evidence["recovery_staged"] = staged_exists
+        try:
+            if staged_exists:
+                if _credential_destination_exists(root_fd, file_name):
+                    raise ValueError(
+                        "handoff artifact recovery state changed"
+                    )
+            else:
+                current = os.stat(
+                    file_name, dir_fd=root_fd, follow_symlinks=False
+                )
+                if (current.st_dev, current.st_ino) != (
+                    evidence["device"],
+                    evidence["inode"],
+                ):
+                    raise ValueError(
+                        "handoff artifact changed before staging"
+                    )
+                _rename_noreplace(
+                    file_name,
+                    staged_name,
+                    source_dir_fd=root_fd,
+                    destination_dir_fd=root_fd,
+                )
+                os.fsync(root_fd)
+            staged = os.stat(
+                staged_name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (staged.st_dev, staged.st_ino) != (
+                evidence["device"],
+                evidence["inode"],
+            ):
+                raise ValueError(
+                    "handoff artifact changed during staging"
+                )
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    closed = False
+
+    def close_descriptor() -> None:
+        nonlocal closed
+        if not closed:
+            os.close(descriptor)
+            closed = True
+
+    def verify_staged() -> None:
+        current = os.stat(
+            staged_name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino)
+            != (evidence["device"], evidence["inode"])
+            or current.st_nlink != 1
+        ):
+            raise ValueError("staged handoff artifact identity changed")
+
+    def rollback() -> None:
+        try:
+            verify_staged()
+            if _credential_destination_exists(root_fd, file_name):
+                raise ValueError(
+                    "handoff artifact destination changed during rollback"
+                )
+            _rename_noreplace(
+                staged_name,
+                file_name,
+                source_dir_fd=root_fd,
+                destination_dir_fd=root_fd,
+            )
+            os.fsync(root_fd)
+        finally:
+            close_descriptor()
+
+    def sanitize() -> dict[str, object]:
+        verify_staged()
+        current = os.fstat(descriptor)
+        if sanitized_audited:
+            if (
+                current.st_size != 0
+                or current.st_dev != sanitized_device
+                or current.st_ino != sanitized_inode
+            ):
+                raise ValueError("sanitized artifact identity changed")
+        elif current.st_size:
+            offset = 0
+            while offset < current.st_size:
+                written = os.pwrite(
+                    descriptor,
+                    b"\x00" * (current.st_size - offset),
+                    offset,
+                )
+                if written <= 0:
+                    raise OSError(
+                        "handoff artifact sanitization made no progress"
+                    )
+                offset += written
+            os.fsync(descriptor)
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+        current = os.fstat(descriptor)
+        if current.st_size != 0 or current.st_nlink != 1:
+            raise ValueError("handoff artifact sanitization was not proven")
+        return {
+            "sanitized": True,
+            "device": current.st_dev,
+            "inode": current.st_ino,
+            "already_sanitized": sanitized_audited,
+        }
+
+    def finalize() -> dict[str, object]:
+        try:
+            try:
+                verify_staged()
+                if os.fstat(descriptor).st_size != 0:
+                    raise ValueError(
+                        "handoff artifact was not sanitized"
+                    )
+                os.unlink(staged_name, dir_fd=root_fd)
+                os.fsync(root_fd)
+            except FileNotFoundError:
+                if os.fstat(descriptor).st_nlink != 0:
+                    raise ValueError(
+                        "staged handoff artifact moved without deletion"
+                    ) from None
+                return {"deleted": True, "already_absent": True}
+            if os.fstat(descriptor).st_nlink != 0:
+                raise ValueError(
+                    "staged handoff artifact unlink was not proven"
+                )
+            return {"deleted": True, "already_absent": False}
+        finally:
+            close_descriptor()
+
+    return (
+        None if already_terminal else rollback,
+        sanitize,
+        finalize,
+        evidence,
+    )
+
+
+def expire_registration_v2_handoff(
+    settings: WorkerControlPlaneSettings,
+    *,
+    worker_id: str,
+    instance_id: str,
+    registration_transaction_id: str,
+    bootstrap_credential_id: str,
+    execute: bool,
+) -> dict[str, object]:
+    root_fd = _open_verified_root(settings)
+    try:
+        connection = _read_only_connection(settings)
+        try:
+            before = connection.total_changes
+            evidence = inspect_expired_orphan_handoff(
+                connection,
+                worker_id=worker_id,
+                instance_id=instance_id,
+                registration_transaction_id=registration_transaction_id,
+                bootstrap_credential_id=bootstrap_credential_id,
+            )
+            if connection.total_changes != before:
+                raise RuntimeError(
+                    "handoff dry-run attempted a database write"
+                )
+        finally:
+            connection.close()
+        file_name = str(evidence["secret_file_name"])
+        staged_name = f"{file_name}.expired"
+        source_exists = _credential_destination_exists(root_fd, file_name)
+        staged_exists = _credential_destination_exists(
+            root_fd, staged_name
+        )
+        if bool(evidence["idempotent"]):
+            if evidence["artifact_deleted_audited"] and (
+                source_exists or staged_exists
+            ):
+                raise ValueError(
+                    "artifact reappeared after verified deletion"
+                )
+            if source_exists:
+                raise ValueError(
+                    "terminal handoff artifact remains retrievable"
+                )
+            if (
+                not staged_exists
+                and not evidence["artifact_sanitized_audited"]
+            ):
+                raise ValueError(
+                    "terminal handoff artifact absence is unproven"
+                )
+            artifact = (
+                _inspect_exact_handoff_artifact(
+                    root_fd, staged_name, allow_empty=True
+                )
+                if staged_exists
+                else {"present": False, "staged": False}
+            )
+            if evidence["artifact_sanitized_audited"] and staged_exists:
+                if (
+                    artifact["size"] != 0
+                    or artifact["device"] != evidence["sanitized_device"]
+                    or artifact["inode"] != evidence["sanitized_inode"]
+                ):
+                    raise ValueError(
+                        "sanitized artifact identity changed"
+                    )
+        else:
+            if source_exists and staged_exists:
+                raise ValueError(
+                    "handoff artifact staging state is ambiguous"
+                )
+            if not source_exists and not staged_exists:
+                raise ValueError("handoff artifact is missing")
+            artifact = _inspect_exact_handoff_artifact(
+                root_fd, staged_name if staged_exists else file_name
+            )
+            artifact["recovery_staged"] = staged_exists
+        artifact["staged"] = staged_exists
+        safe = {
+            key: value
+            for key, value in evidence.items()
+            if key != "secret_file_name"
+        }
+        safe["artifact"] = artifact
+        safe["mode"] = "execute" if execute else "dry-run"
+        safe["summary"] = (
+            "exact expired orphan is eligible"
+            if not evidence["idempotent"]
+            else "exact expired orphan is already terminal"
+        )
+        if not execute:
+            safe["status"] = "eligible"
+            safe["db_writes"] = 0
+            return safe
+        report = expire_expired_orphan_handoff(
+            settings,
+            worker_id=worker_id,
+            instance_id=instance_id,
+            registration_transaction_id=registration_transaction_id,
+            bootstrap_credential_id=bootstrap_credential_id,
+            prepare_artifact=lambda name, terminal, sanitized, device, inode: (
+                _prepare_expired_handoff_artifact(
+                    root_fd,
+                    settings.approved_test_root,
+                    name,
+                    terminal,
+                    sanitized,
+                    device,
+                    inode,
+                )
+            ),
+        )
+        report["mode"] = "execute"
+        report["summary"] = (
+            "exact expired orphan terminalized and artifact removed"
+            if report["status"] == "completed"
+            else "database terminalized; artifact cleanup requires retry"
+        )
+        return report
+    finally:
+        os.close(root_fd)
+
+
+def _format_handoff_lifecycle_report(report: dict[str, object]) -> str:
+    lines = [
+        f"STATUS: {report['status']}",
+        f"MODE: {report['mode']}",
+        "ELIGIBLE: " + ("yes" if report["eligible"] else "no"),
+        "TRANSACTION_ID: "
+        f"{report['registration_transaction_id']}",
+        f"WORKER_ID: {report['worker_id']}",
+        f"INSTANCE_ID: {report['instance_id']}",
+        "BOOTSTRAP_CREDENTIAL_ID: "
+        f"{report['bootstrap_credential_id']}",
+        f"HANDOFF_STATE: {report['handoff_state']}",
+        f"BOOTSTRAP_STATE: {report['bootstrap_state']}",
+        f"SUMMARY: {report['summary']}",
+    ]
+    if report.get("safe_reason"):
+        lines.append(f"SAFE_REASON: {report['safe_reason']}")
+    return "\n".join(lines)
+
+
+def _handoff_lifecycle_error_report(
+    *,
+    worker_id: str,
+    instance_id: str,
+    registration_transaction_id: str,
+    bootstrap_credential_id: str,
+    execute: bool,
+    error: Exception,
+) -> dict[str, object]:
+    if isinstance(error, ValueError):
+        safe_reason = str(error)
+    elif isinstance(error, sqlite3.DatabaseError):
+        safe_reason = "database operation rejected"
+    elif isinstance(error, OSError):
+        safe_reason = "protected artifact operation rejected"
+    else:
+        safe_reason = "operator lifecycle failed"
+    return {
+        "status": "blocked",
+        "mode": "execute" if execute else "dry-run",
+        "eligible": False,
+        "registration_transaction_id": registration_transaction_id,
+        "worker_id": worker_id,
+        "instance_id": instance_id,
+        "bootstrap_credential_id": bootstrap_credential_id,
+        "handoff_state": "unknown",
+        "bootstrap_state": "unknown",
+        "summary": "exact handoff lifecycle operation was rejected",
+        "safe_reason": safe_reason,
+    }
 
 
 def inspect_legacy_bootstrap_artifact(
@@ -1048,6 +1594,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--transaction-id", type=_uuid, required=True
     )
     commission_status.add_argument("--task-id", type=_uuid)
+    handoff = commission_commands.add_parser(
+        "handoff", help="operate one exact Registration v2 handoff"
+    )
+    handoff_commands = handoff.add_subparsers(
+        dest="handoff_command", required=True
+    )
+    handoff_expire = handoff_commands.add_parser(
+        "expire", help="terminalize one exact expired orphan handoff"
+    )
+    handoff_expire.add_argument(
+        "--worker-id", choices=(WORKER_ID,), required=True
+    )
+    handoff_expire.add_argument(
+        "--instance-id", type=_uuid, required=True
+    )
+    handoff_expire.add_argument(
+        "--transaction-id", type=_uuid, required=True
+    )
+    handoff_expire.add_argument(
+        "--credential-id", type=_uuid, required=True
+    )
+    handoff_mode = handoff_expire.add_mutually_exclusive_group(
+        required=True
+    )
+    handoff_mode.add_argument(
+        "--dry-run", action="store_true", help="validate without mutation"
+    )
+    handoff_mode.add_argument(
+        "--execute", action="store_true", help="perform exact cleanup"
+    )
+    handoff_expire.add_argument(
+        "--output", choices=("json", "text"), default="json"
+    )
     artifact = commission_commands.add_parser(
         "legacy-artifact", help="inspect or delete one verified orphan"
     )
@@ -1117,6 +1696,46 @@ def main(argv: list[str] | None = None) -> int:
                 registration_transaction_id=parsed.transaction_id,
                 task_id=parsed.task_id,
             )
+        elif parsed.commission_command == "handoff":
+            try:
+                report = expire_registration_v2_handoff(
+                    settings,
+                    worker_id=parsed.worker_id,
+                    instance_id=parsed.instance_id,
+                    registration_transaction_id=parsed.transaction_id,
+                    bootstrap_credential_id=parsed.credential_id,
+                    execute=parsed.execute,
+                )
+            except (
+                OSError,
+                RuntimeError,
+                sqlite3.DatabaseError,
+                ValueError,
+            ) as exc:
+                report = _handoff_lifecycle_error_report(
+                    worker_id=parsed.worker_id,
+                    instance_id=parsed.instance_id,
+                    registration_transaction_id=parsed.transaction_id,
+                    bootstrap_credential_id=parsed.credential_id,
+                    execute=parsed.execute,
+                    error=exc,
+                )
+            exit_code = (
+                0
+                if report["status"] in ("eligible", "completed")
+                else 3
+                if report["status"] == "cleanup_required"
+                else 2
+            )
+            if parsed.output == "text":
+                print(_format_handoff_lifecycle_report(report))
+            else:
+                print(
+                    json.dumps(
+                        report, sort_keys=True, separators=(",", ":")
+                    )
+                )
+            return exit_code
         elif parsed.action == "inspect":
             report = inspect_legacy_bootstrap_artifact(
                 settings, parsed.name
