@@ -31,7 +31,10 @@ from gateway.worker_control_plane.models import (
     validate_codex_execute_result,
 )
 from gateway.worker_control_plane.service import WorkerControlPlaneService
-from tests.gateway.worker_control_plane_helpers import MockWorkerClient
+from tests.gateway.worker_control_plane_helpers import (
+    MockWorkerClient,
+    authorize_test_handoff,
+)
 
 
 class MutableTestClock:
@@ -152,6 +155,19 @@ async def codex_control_plane(tmp_path):
     provisioned = service.provision_worker(
         capabilities=["system.echo", "codex.execute"]
     )
+    instance_id = str(uuid.uuid4())
+    transaction_id = str(uuid.uuid4())
+    authorize_test_handoff(
+        service,
+        provisioned["secret"],
+        instance_id,
+        transaction_id,
+    )
+    provisioned = {
+        **provisioned,
+        "instance_id": instance_id,
+        "registration_transaction_id": transaction_id,
+    }
     app = create_worker_control_plane_app(settings, service)
     server = TestServer(app)
     client = TestClient(server)
@@ -161,6 +177,17 @@ async def codex_control_plane(tmp_path):
     finally:
         await client.close()
         service.close()
+
+
+def _codex_worker(client, provisioned):
+    return MockWorkerClient(
+        client,
+        provisioned["secret"],
+        instance_id=provisioned["instance_id"],
+        registration_transaction_id=provisioned[
+            "registration_transaction_id"
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -1560,7 +1587,7 @@ async def test_codex_execute_noncompleted_golden_results_are_accepted(
     codex_control_plane, vector_name, expected_task_state
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1601,7 +1628,7 @@ async def test_codex_execute_capability_lifecycle_and_safe_audit(
     codex_control_plane, monkeypatch
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     capabilities = ["system.echo", "codex.execute"]
     assert (await worker.register(capabilities=capabilities))[0] == 201
     access_observations = []
@@ -1689,7 +1716,7 @@ async def test_codex_execute_result_identity_and_inner_schema_are_enforced(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1757,7 +1784,7 @@ async def test_codex_execute_http_rejects_classification_mismatch_before_write(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1789,7 +1816,7 @@ async def test_codex_execute_http_surrogate_is_invalid_result_not_503(
     codex_control_plane, summary
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1821,7 +1848,7 @@ async def test_codex_execute_http_accepts_valid_non_bmp_result(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1848,7 +1875,7 @@ async def test_codex_execute_full_32k_result_contract_is_http_reachable(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1919,7 +1946,7 @@ async def test_transport_oversize_is_413_not_malformed_request(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -1962,7 +1989,7 @@ async def test_codex_execute_timing_stderr_and_outer_extra_field_are_strict(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201
@@ -2025,7 +2052,7 @@ async def test_codex_execute_lease_covers_declared_execution_timeout(
     codex_control_plane
 ):
     service, client, provisioned = codex_control_plane
-    worker = MockWorkerClient(client, provisioned["secret"])
+    worker = _codex_worker(client, provisioned)
     assert (await worker.register(
         capabilities=["system.echo", "codex.execute"]
     ))[0] == 201

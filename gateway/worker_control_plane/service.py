@@ -1,6 +1,6 @@
 """Small transactional domain service for allowlisted Worker capabilities."""
 from __future__ import annotations
-import json, os, secrets, uuid
+import hmac, json, os, secrets, uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from cryptography.exceptions import InvalidTag
@@ -20,6 +20,8 @@ from .models import (
 from .registration_v2 import (
  APPROVED_HEAD,
  BRANCH,
+ bootstrap_binding_id,
+ build_handoff_envelope,
  CAPABILITIES as REGISTRATION_V2_CAPABILITIES,
  HOST,
  MAX_RECOVERIES,
@@ -92,9 +94,13 @@ class WorkerAuthService:
   return row
 
 class WorkerControlPlaneService:
- def __init__(self, settings, *, clock: Callable[[], datetime] | None = None):
+ def __init__(
+  self,settings,*,clock: Callable[[], datetime] | None = None,
+  register_v2_test_hook: Callable[[str], None] | None = None,
+ ):
   if not settings.enabled or settings.test_mode == settings.pilot_mode: raise ValueError('isolated mode required')
   self.settings=settings; self.store=WorkerControlPlaneStore(settings); self._clock=clock or (lambda: datetime.now(timezone.utc)); self.auth=WorkerAuthService(self.store,self.now,self._now_datetime)
+  self._register_v2_test_hook=register_v2_test_hook
   self.reap_expired_registration_v2()
  def _now_datetime(self):
   value=self._clock()
@@ -187,14 +193,17 @@ class WorkerControlPlaneService:
      c.execute(
       "INSERT INTO worker_registration_handoffs_v2("
       "registration_transaction_id,worker_id,instance_id,"
-      "bootstrap_credential_id,secret_file_name,expected_source_ip,"
+      "bootstrap_credential_id,bootstrap_binding_id,secret_file_name,"
+      "expected_source_ip,"
       "host,path_id,path_digest,remote,branch,approved_head,"
-      "capabilities_json,state,issued_at,expires_at,retrieved_at"
-      ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,NULL)",
+      "capabilities_json,state,issued_at,expires_at,retrieved_at,"
+      "consumed_at"
+      ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,NULL,NULL)",
       (
        handoff['registration_transaction_id'],WORKER_ID,
-       handoff['instance_id'],credential_id,handoff['secret_file_name'],
-       handoff['expected_source_ip'],HOST,PATH_ID,PATH_DIGEST,REMOTE,
+       handoff['instance_id'],credential_id,bootstrap_binding_id(secret),
+       handoff['secret_file_name'],handoff['expected_source_ip'],
+       HOST,PATH_ID,PATH_DIGEST,REMOTE,
        BRANCH,APPROVED_HEAD,capabilities_json,issued_at,expires_at,
       ),
      )
@@ -272,7 +281,10 @@ class WorkerControlPlaneService:
   if expired:
    raise error('invalid_credential')
   secret=read_and_remove_secret(file_name)
-  return secret
+  try:
+   return build_handoff_envelope(row,secret)
+  except ValueError:
+   raise error('invalid_credential') from None
  def seed_test_worker(self):
   if not self.settings.test_mode: raise RuntimeError('test mode required')
   return self.provision_worker()['secret']
@@ -647,6 +659,34 @@ class WorkerControlPlaneService:
     or allowed_capabilities!=REGISTRATION_V2_CAPABILITIES
    ):
     raise error('unsupported_capability')
+   handoff=c.execute(
+    "SELECT * FROM worker_registration_handoffs_v2 "
+    "WHERE registration_transaction_id=?",
+    (d['registration_transaction_id'],),
+   ).fetchone()
+   expected_capabilities=json.dumps(
+    REGISTRATION_V2_CAPABILITIES,separators=(',',':')
+   )
+   target=d['target_identity']
+   if (
+    handoff is None or handoff['state']!='retrieved'
+    or handoff['consumed_at'] is not None
+    or handoff['worker_id']!=d['worker_id']
+    or handoff['instance_id']!=d['instance_id']
+    or handoff['bootstrap_credential_id']!=bootstrap['credential_id']
+    or not hmac.compare_digest(
+     handoff['bootstrap_binding_id'],bootstrap_binding_id(secret)
+    )
+    or handoff['host']!=d['host'] or handoff['path_id']!=d['path_id']
+    or handoff['path_digest']!=target['path_digest']
+    or handoff['remote']!=target['remote']
+    or handoff['branch']!=target['branch']
+    or handoff['approved_head']!=target['approved_head']
+    or handoff['capabilities_json']!=expected_capabilities
+    or handoff['issued_at']>self.now()
+    or handoff['expires_at']<=self.now()
+   ):
+    raise error('invalid_credential')
    transaction=c.execute(
     "SELECT * FROM worker_registration_transactions_v2 "
     "WHERE registration_transaction_id=?",
@@ -754,7 +794,6 @@ class WorkerControlPlaneService:
        credential_id,None,
       ),
      )
-    target=d['target_identity']
     provisional={
      'registration_transaction_id':d['registration_transaction_id'],
      'registration_id':registration_id,
@@ -802,6 +841,23 @@ class WorkerControlPlaneService:
      "WHERE registration_transaction_id=?",
      (d['registration_transaction_id'],),
     ).fetchone()
+    if self._register_v2_test_hook is not None:
+     self._register_v2_test_hook('after_registration_insert')
+     self._register_v2_test_hook('before_handoff_consume')
+    consumed_at=self.now()
+    if c.execute(
+     "UPDATE worker_registration_handoffs_v2 SET consumed_at=? "
+     "WHERE registration_transaction_id=? AND state='retrieved' "
+     "AND consumed_at IS NULL",
+     (consumed_at,d['registration_transaction_id']),
+    ).rowcount!=1:
+     raise error('invalid_credential')
+    self._audit(
+     c,'registration_v2_handoff_consumed',
+     worker_id=d['worker_id'],instance_id=d['instance_id'],
+     registration_id=registration_id,outcome='consumed',
+     reason_code=d['registration_transaction_id'],
+    )
     response=self._registration_v2_response(transaction,token)
     audit_id=self._audit(
      c,

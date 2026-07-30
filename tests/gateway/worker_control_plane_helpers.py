@@ -7,13 +7,77 @@ import hmac
 import json
 import uuid
 
+from gateway.worker_control_plane.registration_v2 import (
+    APPROVED_HEAD,
+    BRANCH,
+    CAPABILITIES,
+    HOST,
+    PATH_DIGEST,
+    PATH_ID,
+    REMOTE,
+    bootstrap_binding_id,
+)
+
+
+def authorize_test_handoff(
+    service,
+    secret,
+    instance_id,
+    registration_transaction_id,
+):
+    bootstrap = service.store.conn.execute(
+        "SELECT credential_id,issued_at,expires_at FROM worker_credentials "
+        "WHERE worker_id=? AND kind='bootstrap' AND revoked_at IS NULL",
+        ("server-a-worker",),
+    ).fetchone()
+    if bootstrap is None:
+        raise AssertionError("test bootstrap credential missing")
+    with service.store.transaction() as connection:
+        connection.execute(
+            "INSERT INTO worker_registration_handoffs_v2("
+            "registration_transaction_id,worker_id,instance_id,"
+            "bootstrap_credential_id,bootstrap_binding_id,secret_file_name,"
+            "expected_source_ip,host,path_id,path_digest,remote,branch,"
+            "approved_head,capabilities_json,state,issued_at,expires_at,"
+            "retrieved_at,consumed_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'retrieved',?,?,?,NULL)",
+            (
+                registration_transaction_id,
+                "server-a-worker",
+                instance_id,
+                bootstrap["credential_id"],
+                bootstrap_binding_id(secret),
+                f"test-{registration_transaction_id}.secret",
+                "100.64.0.1",
+                HOST,
+                PATH_ID,
+                PATH_DIGEST,
+                REMOTE,
+                BRANCH,
+                APPROVED_HEAD,
+                json.dumps(CAPABILITIES, separators=(",", ":")),
+                bootstrap["issued_at"],
+                bootstrap["expires_at"],
+                service.now(),
+            ),
+        )
+
 
 class MockWorkerClient:
-    def __init__(self, client, bootstrap_secret: str, *, worker_id: str = "server-a-worker"):
+    def __init__(
+        self,
+        client,
+        bootstrap_secret: str,
+        *,
+        worker_id: str = "server-a-worker",
+        instance_id: str | None = None,
+        registration_transaction_id: str | None = None,
+    ):
         self.client = client
         self.bootstrap_secret = bootstrap_secret
         self.worker_id = worker_id
-        self.instance_id = str(uuid.uuid4())
+        self.instance_id = instance_id or str(uuid.uuid4())
+        self.registration_transaction_id = registration_transaction_id
         self.registration_id = None
         self.access_token = None
         self.capabilities = ["system.echo"]
@@ -29,7 +93,11 @@ class MockWorkerClient:
             ["system.echo"] if capabilities is None else capabilities
         )
         if requested_capabilities == ["system.echo", "codex.execute"]:
-            transaction_id = str(uuid.uuid4())
+            transaction_id = self.registration_transaction_id
+            if transaction_id is None:
+                raise AssertionError(
+                    "Registration v2 test requires an authorized transaction"
+                )
             path_digest = hashlib.sha256(
                 b"windows-path-v1|desktop-87sshtu|"
                 b"c:\\hermesserverworker-deploy"
@@ -41,7 +109,7 @@ class MockWorkerClient:
                 ),
                 "branch": "main",
                 "approved_head": (
-                    "dbdc56792d1926fb19b7e22e1a282fd96a82cd76"
+                    "ac8989ae9012ae70eb5f12d1a78260471b0a9728"
                 ),
             }
             register_body = {

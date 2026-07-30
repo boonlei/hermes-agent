@@ -32,6 +32,9 @@ from gateway.worker_control_plane.registration_v2 import (
     PATH_ID,
     REMOTE,
 )
+from tests.gateway.worker_control_plane_helpers import (
+    authorize_test_handoff,
+)
 
 
 def _mode(path) -> int:
@@ -69,6 +72,9 @@ def _register_v2_direct(service, secret, instance_id, worker_name):
         "target_identity": target_identity,
         "registration_transaction_id": transaction_id,
     }
+    authorize_test_handoff(
+        service, secret, instance_id, transaction_id
+    )
     status, issued = service.register_worker_v2(request, secret)
     confirmation = {
         "protocol_version": 2,
@@ -1879,6 +1885,7 @@ def test_fresh_database_has_complete_atomic_lifecycle_schema(tmp_path):
                     wcp_storage.CAPABILITY_MIGRATION_V4,
                     wcp_storage.REGISTRATION_TRANSACTION_MIGRATION_V5,
                     wcp_storage.REGISTRATION_HANDOFF_MIGRATION_V6,
+                    wcp_storage.REGISTRATION_HANDOFF_BINDING_MIGRATION_V7,
             }
         )
     finally:
@@ -1987,7 +1994,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
                 "SELECT version,applied_at FROM schema_migrations"
             )
         }
-        assert len(migrations) == 6
+        assert len(migrations) == 7
         assert tuple(
             (name, migrations[name]) for name, _ in legacy["migrations"]
         ) == legacy["migrations"]
@@ -1998,6 +2005,10 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             in migrations
         )
         assert wcp_storage.REGISTRATION_HANDOFF_MIGRATION_V6 in migrations
+        assert (
+            wcp_storage.REGISTRATION_HANDOFF_BINDING_MIGRATION_V7
+            in migrations
+        )
         assert service.store.conn.execute(
             "SELECT count(*) FROM worker_registration_transactions_v2"
         ).fetchone()[0] == 0
@@ -2161,7 +2172,7 @@ def test_real_v2_to_v3_migration_preserves_and_enforces_lifecycle(tmp_path):
             )
         }
         assert second_applied_at == applied_at
-        assert len(second_applied_at) == 6
+        assert len(second_applied_at) == 7
         reopened.check_health()
     finally:
         reopened.close()

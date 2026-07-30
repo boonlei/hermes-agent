@@ -20,6 +20,10 @@ REGISTRATION_TRANSACTION_MIGRATION_V5 = (
 REGISTRATION_HANDOFF_MIGRATION_V6 = (
  "worker_control_plane_registration_handoff_v6"
 )
+REGISTRATION_HANDOFF_BINDING_MIGRATION_V7 = (
+ "worker_control_plane_registration_handoff_binding_v7"
+)
+LEGACY_HANDOFF_BINDING = "0" * 64
 
 WORKER_TASKS_SCHEMA = (
  "CREATE TABLE IF NOT EXISTS worker_tasks("
@@ -62,12 +66,14 @@ SCHEMA_STATEMENTS = (
  "worker_id TEXT NOT NULL REFERENCES workers(worker_id), "
  "instance_id TEXT NOT NULL, bootstrap_credential_id TEXT NOT NULL UNIQUE "
  "REFERENCES worker_credentials(credential_id), "
+ f"bootstrap_binding_id TEXT NOT NULL DEFAULT '{LEGACY_HANDOFF_BINDING}', "
  "secret_file_name TEXT NOT NULL UNIQUE, expected_source_ip TEXT NOT NULL, "
  "host TEXT NOT NULL, path_id TEXT NOT NULL, path_digest TEXT NOT NULL, "
  "remote TEXT NOT NULL, branch TEXT NOT NULL, approved_head TEXT NOT NULL, "
  "capabilities_json TEXT NOT NULL, "
  "state TEXT NOT NULL CHECK(state IN ('pending','retrieved','expired','revoked')), "
- "issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, retrieved_at TEXT)",
+ "issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, retrieved_at TEXT, "
+ "consumed_at TEXT)",
  WORKER_TASKS_SCHEMA,
  "CREATE TABLE IF NOT EXISTS worker_deliveries(delivery_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES worker_tasks(task_id), worker_id TEXT NOT NULL, registration_id TEXT NOT NULL REFERENCES worker_instances(registration_id), attempt INTEGER NOT NULL, state TEXT NOT NULL, leased_at TEXT NOT NULL, ack_deadline_at TEXT NOT NULL, lease_expires_at TEXT NOT NULL, acknowledged_at TEXT, finished_at TEXT, UNIQUE(task_id, attempt))",
  "CREATE TABLE IF NOT EXISTS worker_results(result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES worker_tasks(task_id), delivery_id TEXT NOT NULL UNIQUE REFERENCES worker_deliveries(delivery_id), result_idempotency_key TEXT NOT NULL, result_hash TEXT NOT NULL, status TEXT NOT NULL, stdout TEXT NOT NULL, stderr TEXT NOT NULL, exit_code INTEGER, started_at TEXT NOT NULL, finished_at TEXT NOT NULL, duration_ms INTEGER NOT NULL, accepted_at TEXT NOT NULL, UNIQUE(task_id, result_idempotency_key))",
@@ -152,6 +158,22 @@ class WorkerControlPlaneStore:
     "CREATE INDEX IF NOT EXISTS idx_registration_handoffs_v2_state "
     "ON worker_registration_handoffs_v2(state,expires_at)"
    )
+   handoff_columns={
+    row["name"] for row in self.conn.execute(
+     "PRAGMA table_info(worker_registration_handoffs_v2)"
+    )
+   }
+   if "bootstrap_binding_id" not in handoff_columns:
+    self.conn.execute(
+     "ALTER TABLE worker_registration_handoffs_v2 ADD COLUMN "
+     "bootstrap_binding_id TEXT NOT NULL DEFAULT "
+     f"'{LEGACY_HANDOFF_BINDING}'"
+    )
+   if "consumed_at" not in handoff_columns:
+    self.conn.execute(
+     "ALTER TABLE worker_registration_handoffs_v2 "
+     "ADD COLUMN consumed_at TEXT"
+    )
    registration_v2_info={
     row["name"]:row for row in self.conn.execute(
      "PRAGMA table_info(worker_registration_transactions_v2)"
@@ -293,6 +315,9 @@ class WorkerControlPlaneStore:
     "worker_id":("TEXT",1,0,None),
     "instance_id":("TEXT",1,0,None),
     "bootstrap_credential_id":("TEXT",1,0,None),
+    "bootstrap_binding_id":(
+     "TEXT",1,0,f"'{LEGACY_HANDOFF_BINDING}'"
+    ),
     "secret_file_name":("TEXT",1,0,None),
     "expected_source_ip":("TEXT",1,0,None),
     "host":("TEXT",1,0,None),
@@ -306,6 +331,7 @@ class WorkerControlPlaneStore:
     "issued_at":("TEXT",1,0,None),
     "expires_at":("TEXT",1,0,None),
     "retrieved_at":("TEXT",0,0,None),
+    "consumed_at":("TEXT",0,0,None),
    }
    if set(handoff_info)!=set(expected_handoff_columns):
     raise sqlite3.DatabaseError(
@@ -388,6 +414,10 @@ class WorkerControlPlaneStore:
    self.conn.execute(
     "INSERT OR IGNORE INTO schema_migrations VALUES(?,datetime('now'))",
     (REGISTRATION_HANDOFF_MIGRATION_V6,),
+   )
+   self.conn.execute(
+    "INSERT OR IGNORE INTO schema_migrations VALUES(?,datetime('now'))",
+    (REGISTRATION_HANDOFF_BINDING_MIGRATION_V7,),
    )
    if self.conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
     raise sqlite3.DatabaseError("worker control plane foreign key check failed")

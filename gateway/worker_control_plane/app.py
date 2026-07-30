@@ -564,7 +564,7 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
         except ValueError:
             raise error("malformed_request") from None
         source_ip = _verified_proxy_source(request)
-        secret = svc.retrieve_registration_v2_handoff(
+        envelope = svc.retrieve_registration_v2_handoff(
             transaction_id,
             query["worker_id"],
             instance_id,
@@ -573,9 +573,8 @@ def create_worker_control_plane_app(settings: WorkerControlPlaneSettings, servic
                 settings, file_name
             ),
         )
-        return web.Response(
-            text=secret,
-            content_type="text/plain",
+        return web.json_response(
+            envelope,
             headers={
                 "Cache-Control": "no-store",
                 "Pragma": "no-cache",

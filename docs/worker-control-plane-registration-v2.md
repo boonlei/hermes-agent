@@ -228,8 +228,8 @@ to a protected staging file and never appear in an argument or terminal:
 
 ```powershell
 $credentialDir = 'C:\ProgramData\HermesWorker\credentials'
-$destination = Join-Path $credentialDir 'bootstrap.secret'
-$staging = Join-Path $credentialDir ('.bootstrap.' + [guid]::NewGuid() + '.tmp')
+$destination = Join-Path $credentialDir 'registration-v2-handoff.json'
+$staging = Join-Path $credentialDir ('.registration-v2-handoff.' + [guid]::NewGuid() + '.tmp')
 if (Test-Path -LiteralPath $destination) { throw 'bootstrap destination exists' }
 New-Item -ItemType Directory -Force -Path $credentialDir | Out-Null
 icacls.exe $credentialDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)(F)' 'BUILTIN\Administrators:(OI)(CI)(F)' 'HermesWorkerSvc:(OI)(CI)(R)' | Out-Null
@@ -247,7 +247,12 @@ try {
 C:\HermesServerWorker-deploy\.venv\Scripts\python.exe -m worker.main --register-v2-only --config C:\HermesServerWorker-deploy\config\worker.commissioning.example.json
 ```
 
-Do not retry retrieval or create a second transaction after a failure.
+Do not retry retrieval or create a second transaction after a failure. The
+downloaded closed JSON envelope contains the server-authorized transaction ID
+and bootstrap material. Its HMAC binds the transaction, Worker and instance,
+bootstrap credential, target identity, ordered capabilities, issue time, and
+expiry. The Worker verifies and durably persists that exact transaction before
+Register; missing or invalid metadata fails before any network request.
 Inspect safe server state without reading credentials:
 
 ```text

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "protocol_version": 2,
+  "registration_transaction_id": "44444444-4444-4444-8444-444444444444",
+  "worker_id": "server-a-worker",
+  "instance_id": "11111111-1111-4111-8111-111111111111",
+  "bootstrap_credential_id": "33333333-3333-4333-8333-333333333333",
+  "bootstrap_binding_id": "db22de8b2bc9f3fa3c5e5dc6edeabe1e7282f4dfcc33c163e6c42780b7809b1a",
+  "host": "DESKTOP-87SSHTU",
+  "path_id": "hermes-server-worker",
+  "target_identity": {
+    "path_digest": "e8f0e3d56567d83c62ce7c3cc72e84188ee217660680b153e41f25e97c546a95",
+    "remote": "https://github.com/boonlei/HermesServerWorker.git",
+    "branch": "main",
+    "approved_head": "dddddddddddddddddddddddddddddddddddddddd"
+  },
+  "capabilities": [
+    "system.echo",
+    "codex.execute"
+  ],
+  "issued_at": "2026-07-30T00:00:00Z",
+  "expires_at": "2026-07-30T00:15:00Z",
+  "bootstrap_secret": "cross-repo-test-bootstrap",
+  "authentication_tag": "843b90aa82a03984ea05bc346f3a300f495840a05fd643e1f115ca09207ecc5f"
+}
